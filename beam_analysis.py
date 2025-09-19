@@ -56,6 +56,7 @@ from typing import Dict, Tuple, Optional
 
 __all__ = [
     "bg_subtract",
+    "estimate_background_edge_ring",
     "get_beam_size",
     "fit_gaussian",
     "iso_second_moment",
@@ -96,19 +97,64 @@ def bg_subtract(img: ArrayLike) -> np.ndarray:
     corners += arr[-m:, :m].ravel().tolist()
     corners += arr[-m:, -m:].ravel().tolist()
     b = np.array(corners, dtype=np.float64)
-    # sigma clipping: three iterations of clipping at ±3σ around the median
+    # sigma clipping: three iterations of clipping at ±3·max(σ, eps) around the median
     for _ in range(3):
         mu = np.median(b)
-        sig = 1.4826 * np.median(np.abs(b - mu))  # robust MAD to sigma
-        if sig < np.finfo(float).eps:
-            # avoid division by zero; break early
-            break
-        mask = np.abs(b - mu) < 3.0 * sig
+        mad_raw = np.median(np.abs(b - mu))
+        sig = 1.4826 * mad_raw  # robust MAD to sigma
+        thresh = 3.0 * max(sig, np.finfo(float).eps)
+        mask = np.abs(b - mu) < thresh
         if not np.any(mask):
             break
         b = b[mask]
     bg = np.median(b)
     return arr - bg
+
+
+def estimate_background_edge_ring(img: ArrayLike) -> float:
+    """Estimate background from an edge ring with robust clipping.
+
+    Uses a border ring of width m = ceil(5% * min(h, w)) around the
+    image, applying 3 rounds of sigma clipping around the median with a
+    threshold of 3*max(sigma, eps). Returns the median of the clipped
+    samples as the background estimate.
+
+    Parameters
+    ----------
+    img : array_like
+        2D input image.
+
+    Returns
+    -------
+    float
+        Estimated scalar background level.
+    """
+    arr = np.asarray(img, dtype=np.float64)
+    h, w = arr.shape
+    if h == 0 or w == 0:
+        return 0.0
+    m = int(np.ceil(0.05 * min(h, w)))
+    if m < 1:
+        # fall back to global median
+        vals = arr.ravel()
+    else:
+        # build edge ring without duplicating corners multiple times
+        top = arr[:m, :]
+        bottom = arr[-m:, :]
+        left = arr[m:-m, :m] if h > 2 * m else np.empty((0, 0))
+        right = arr[m:-m, -m:] if h > 2 * m else np.empty((0, 0))
+        vals = np.concatenate([top.ravel(), bottom.ravel(), left.ravel(), right.ravel()])
+    b = np.array(vals, dtype=np.float64)
+    for _ in range(3):
+        mu = np.median(b)
+        mad_raw = np.median(np.abs(b - mu))
+        sig = 1.4826 * mad_raw
+        thresh = 3.0 * max(sig, np.finfo(float).eps)
+        mask = np.abs(b - mu) < thresh
+        if not np.any(mask):
+            break
+        b = b[mask]
+    return float(np.median(b))
 
 
 def get_beam_size(profile: ArrayLike) -> Tuple[float, float, float, float, float]:
@@ -207,7 +253,7 @@ def fit_gaussian(x: np.ndarray, y: np.ndarray, start_params: Tuple[float, float,
 
 def iso_second_moment(
     img: ArrayLike,
-    aperture_factor: float = 2.0,
+    aperture_factor: float = 3.0,
     principal_axes_rot: bool = True,
     tol: float = 1e-1,
     max_iterations: int = 100,
@@ -322,9 +368,12 @@ def iso_second_moment(
         ymin = max(ymin, 0)
         xmax = min(xmax, nx - 1)
         ymax = min(ymax, ny - 1)
-        # extract and subtract background
+        # extract and subtract background on the crop as in M2tool (corner-based BGsub)
         cropped = full_img[ymin:ymax + 1, xmin:xmax + 1]
         processed = bg_subtract(cropped)
+        # Prevent negative tails from biasing second moments when background
+        # varies across the ROI (stability improvement vs. MATLAB reference)
+        processed = np.clip(processed, 0.0, None)
         # compute second moment radii and centroid in the cropped frame
         rx_new, ry_new, cx_local, cy_local, phi = get_beam_size(processed)
         # update global centre coordinates
@@ -348,6 +397,7 @@ def iso_second_moment(
     # optionally rotate the final processed image to align principal axes
     rotated_img = None
     rotated_crop_origin = None
+    phi_rot = None  # rotation in the rotated image frame (expected ~0)
     if principal_axes_rot and processed_img is not None:
         # rotate by angle phi (convert to degrees) around the centre of the cropped image
         # use SciPy's rotate with resize=True to retain all information
@@ -368,13 +418,16 @@ def iso_second_moment(
         # compute global centre in original coordinates (fractional) for rotated image
         cx = cx_rot_local + rotated_crop_origin[1]
         cy = cy_rot_local + rotated_crop_origin[0]
-        phi = phi_rot
     return {
         "cx": cx,
         "cy": cy,
         "rx": rx,
         "ry": ry,
+        # phi is the rotation angle of the principal axis in the original
+        # (unrotated) image coordinates. If the image was rotated for
+        # analysis, phi_rot will be close to 0.
         "phi": phi,
+        "phi_rot": phi_rot,
         "iterations": iterations,
         "processed_img": processed_img,
         "crop_origin": (crop_ymin, crop_xmin),
@@ -385,7 +438,7 @@ def iso_second_moment(
 
 def analyze_beam(
     img: ArrayLike,
-    aperture_factor: float = 2.0,
+    aperture_factor: float = 3.0,
     principal_axes_rot: bool = True,
     tol: float = 1e-1,
     max_iterations: int = 100,
@@ -403,7 +456,7 @@ def analyze_beam(
         Input 2D image representing the beam profile.
     aperture_factor : float, optional
         Factor by which the cropping window is larger than the current
-        diameter estimate (default 3.0).
+        diameter estimate (default 2.0).
     principal_axes_rot : bool, optional
         Whether to rotate the image to align the principal axes.  For
         non‑cylindrical beams this is recommended.
