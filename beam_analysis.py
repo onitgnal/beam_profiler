@@ -255,7 +255,7 @@ def iso_second_moment(
     img: ArrayLike,
     aperture_factor: float = 3.0,
     principal_axes_rot: bool = True,
-    tol: float = 1e-1,
+    tol: float = 1,
     max_iterations: int = 100,
 ) -> Dict[str, object]:
     """Iteratively compute ISO second‑moment beam parameters.
@@ -398,25 +398,69 @@ def iso_second_moment(
     rotated_crop_origin = None
     phi_rot = None  # rotation in the rotated image frame (expected ~0)
     if principal_axes_rot and processed_img is not None:
-        # rotate by angle phi (convert to degrees) around the centre of the cropped image
-        # use SciPy's rotate with resize=True to retain all information
-        rot_deg = phi * 180.0 / np.pi
-        rotated = nd_rotate(processed_img, angle=rot_deg, reshape=True, order=1, mode='constant', cval=0.0)
-        rotated_img = rotated
-        # after rotation the image grows; compute the origin shift relative to full image
+        # Rotate a larger section of the background-subtracted full image so the
+        # rotated data retains realistic edge noise. After rotation the image is
+        # cropped back to the processed-image size for downstream analysis.
+        cx_pre_rot, cy_pre_rot = cx, cy
         h_old, w_old = processed_img.shape
-        h_new, w_new = rotated.shape
-        # the rotated image is centred on the original cropped region; the offset between
-        # the two is half the difference in size【881670830533059†screenshot】
-        dy_offset = (h_new - h_old) / 2.0
-        dx_offset = (w_new - w_old) / 2.0
-        rotated_crop_origin = (crop_ymin - dy_offset, crop_xmin - dx_offset)
-        # update radii and centre from rotated image to align with principal axes
-        rx_rot, ry_rot, cx_rot_local, cy_rot_local, phi_rot = get_beam_size(rotated)
-        rx, ry = rx_rot, ry_rot
-        # compute global centre in original coordinates (fractional) for rotated image
-        cx = cx_rot_local + rotated_crop_origin[1]
-        cy = cy_rot_local + rotated_crop_origin[0]
+        if h_old > 0 and w_old > 0:
+            rot_deg = phi * 180.0 / np.pi
+            abs_cos = float(abs(np.cos(phi)))
+            abs_sin = float(abs(np.sin(phi)))
+            rot_h = int(np.ceil(h_old * abs_cos + w_old * abs_sin)) + 2
+            rot_w = int(np.ceil(h_old * abs_sin + w_old * abs_cos)) + 2
+            rot_h = max(rot_h, h_old)
+            rot_w = max(rot_w, w_old)
+
+            y_offset = int(np.floor((rot_h - h_old) / 2.0))
+            x_offset = int(np.floor((rot_w - w_old) / 2.0))
+            ymin_exp = crop_ymin - y_offset
+            xmin_exp = crop_xmin - x_offset
+            ymax_exp = ymin_exp + rot_h
+            xmax_exp = xmin_exp + rot_w
+
+            expanded_patch = np.zeros((rot_h, rot_w), dtype=np.float64)
+            y_in_start = max(ymin_exp, 0)
+            y_in_end = min(ymax_exp, ny)
+            x_in_start = max(xmin_exp, 0)
+            x_in_end = min(xmax_exp, nx)
+            patch_y_start = y_in_start - ymin_exp
+            patch_x_start = x_in_start - xmin_exp
+            patch_y_end = patch_y_start + (y_in_end - y_in_start)
+            patch_x_end = patch_x_start + (x_in_end - x_in_start)
+            if patch_y_start < patch_y_end and patch_x_start < patch_x_end:
+                expanded_patch[patch_y_start:patch_y_end, patch_x_start:patch_x_end] = (
+                    full_img[y_in_start:y_in_end, x_in_start:x_in_end]
+                )
+
+            expanded_processed = bg_subtract(expanded_patch)
+            y_insert_end = y_offset + h_old
+            x_insert_end = x_offset + w_old
+            expanded_processed[y_offset:y_insert_end, x_offset:x_insert_end] = processed_img
+
+            rotated_full = nd_rotate(
+                expanded_processed,
+                angle=rot_deg,
+                reshape=False,
+                order=1,
+                mode="constant",
+                cval=0.0,
+            )
+            start_y = y_offset
+            start_x = x_offset
+            end_y = start_y + h_old
+            end_x = start_x + w_old
+            rotated_cropped = rotated_full[start_y:end_y, start_x:end_x]
+            rotated_img = rotated_cropped
+
+            rx_rot, ry_rot, cx_rot_local, cy_rot_local, phi_rot = get_beam_size(rotated_img)
+            rx, ry = rx_rot, ry_rot
+            rotated_crop_origin = (
+                cy_pre_rot - cy_rot_local,
+                cx_pre_rot - cx_rot_local,
+            )
+            cx = cx_rot_local + rotated_crop_origin[1]
+            cy = cy_rot_local + rotated_crop_origin[0]
     return {
         "cx": cx,
         "cy": cy,
@@ -439,7 +483,7 @@ def analyze_beam(
     img: ArrayLike,
     aperture_factor: float = 3.0,
     principal_axes_rot: bool = True,
-    tol: float = 1e-1,
+    tol: float = 0.5,
     max_iterations: int = 100,
 ) -> Dict[str, object]:
     """Analyse a beam image and return ISO and Gaussian beam parameters.
@@ -502,17 +546,17 @@ def analyze_beam(
     # non‑negative.  This is consistent with the MATLAB implementation
     # which subtracts a constant background but does not allow the sum
     # over an axis to become negative【881670830533059†screenshot】.
-    img_clipped = np.clip(img_for_spec, 0.0, None)
+    #img_clipped = np.clip(img_for_spec, 0.0, None)
     # compute 1D spectra (integrated profiles)
-    Ix = img_clipped.sum(axis=0)
-    Iy = img_clipped.sum(axis=1)
+    Ix = img_for_spec.sum(axis=0)
+    Iy = img_for_spec.sum(axis=1)
     # baseline subtraction: remove any constant offset by subtracting the
     # minimum of each spectrum.  Real beam profiles should be non‑negative
     # and decay to a baseline; subtracting the minimum helps the Gaussian
     # fit ignore residual background.  Without this step the fit may
     # return an unrealistically small radius when the tail dominates.
-    Ix = Ix - Ix.min()
-    Iy = Iy - Iy.min()
+    #Ix = Ix - Ix.min()
+    #Iy = Iy - Iy.min()
     # initial guesses for Gaussian fit using ISO results
     # amplitude guess: max value of spectrum
     # centre guess: ISO centroid along each axis
@@ -526,6 +570,7 @@ def analyze_beam(
     # fit along y
     params_y, cov_y = fit_gaussian(y_positions, Iy, (Iy.max(), centre_y, max(ry, 1e-3)))
     return {
+        "img_for_spec": img_for_spec,
         "theta": iso_result["phi"],
         "rx_iso": iso_result["rx"],
         "ry_iso": iso_result["ry"],

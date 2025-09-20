@@ -679,7 +679,7 @@ function beamData(f_mainUI)
 
                 %ISO beam radia in beams principal planes
                 if config.principalAxesRot
-                    rotIMG = rotateIMG(processedIMG,phi);
+                    rotIMG = rotateIMG(processedIMG,phi,profile,xmin,xmax,ymin,ymax);
                 else
                     rotIMG = processedIMG;
                     phi = 0;
@@ -812,12 +812,60 @@ function beamData(f_mainUI)
 
 end
 
-function IMG = rotateIMG(IMG,phi)
+function IMG = rotateIMG(IMG,phi,fullIMG,xmin,xmax,ymin,ymax)
 
-    tform = randomAffine2d('Rotation',[phi,phi]*180/pi);
-    IMG = imwarp(IMG,tform,...
-        'OutputView',affineOutputView(size(IMG),tform,'BoundsStyle','FollowOutput'));%SameAsInput CenterOutput FollowOutput
+    [Ny_full, Nx_full] = size(fullIMG);
+    [Ny_roi, Nx_roi] = size(IMG);
 
+    rotDeg = phi * 180/pi;
+    abs_cos = abs(cos(phi));
+    abs_sin = abs(sin(phi));
+
+    rot_h = max(Ny_roi, ceil(Ny_roi * abs_cos + Nx_roi * abs_sin) + 2);
+    rot_w = max(Nx_roi, ceil(Ny_roi * abs_sin + Nx_roi * abs_cos) + 2);
+
+    y_offset = floor((rot_h - Ny_roi)/2);
+    x_offset = floor((rot_w - Nx_roi)/2);
+
+    ymin_exp = ymin - y_offset;
+    xmin_exp = xmin - x_offset;
+    ymax_exp = ymin_exp + rot_h - 1;
+    xmax_exp = xmin_exp + rot_w - 1;
+
+    expanded_patch = zeros(rot_h, rot_w);
+
+    y_in_start = max(ymin_exp, 1);
+    y_in_end = min(ymax_exp, Ny_full);
+    x_in_start = max(xmin_exp, 1);
+    x_in_end = min(xmax_exp, Nx_full);
+
+    if y_in_start <= y_in_end && x_in_start <= x_in_end
+        patch_y_start = y_in_start - ymin_exp + 1;
+        patch_y_end = patch_y_start + (y_in_end - y_in_start);
+        patch_x_start = x_in_start - xmin_exp + 1;
+        patch_x_end = patch_x_start + (x_in_end - x_in_start);
+
+        expanded_patch(patch_y_start:patch_y_end, patch_x_start:patch_x_end) = ...
+            fullIMG(y_in_start:y_in_end, x_in_start:x_in_end);
+    end
+
+    expanded_patch(y_offset+1:y_offset+Ny_roi, x_offset+1:x_offset+Nx_roi) = IMG;
+
+    target_sum = sum(IMG(:));
+
+    rotated_full = imrotate(expanded_patch, rotDeg, 'bilinear', 'crop');
+
+    start_y = y_offset + 1;
+    end_y = start_y + Ny_roi - 1;
+    start_x = x_offset + 1;
+    end_x = start_x + Nx_roi - 1;
+
+    IMG = rotated_full(start_y:end_y, start_x:end_x);
+
+    orig_sum = sum(IMG(:));
+    if target_sum ~= 0 && orig_sum ~= 0
+        IMG = IMG * (target_sum / orig_sum);
+    end
 
 end
 
