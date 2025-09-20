@@ -326,6 +326,8 @@ def iso_second_moment(
     """
     # convert to float and ensure a copy so modifications do not affect the original
     full_img = np.asarray(img, dtype=np.float64)
+    # One-time global background subtraction to match M2tool's behavior
+    full_img = bg_subtract(full_img)
     ny, nx = full_img.shape
     # initial centre: use smoothed image to avoid hot pixels
     smoothed = gaussian_filter(full_img, sigma=2.0)
@@ -371,9 +373,6 @@ def iso_second_moment(
         # extract and subtract background on the crop as in M2tool (corner-based BGsub)
         cropped = full_img[ymin:ymax + 1, xmin:xmax + 1]
         processed = bg_subtract(cropped)
-        # Prevent negative tails from biasing second moments when background
-        # varies across the ROI (stability improvement vs. MATLAB reference)
-        processed = np.clip(processed, 0.0, None)
         # compute second moment radii and centroid in the cropped frame
         rx_new, ry_new, cx_local, cy_local, phi = get_beam_size(processed)
         # update global centre coordinates
@@ -456,7 +455,7 @@ def analyze_beam(
         Input 2D image representing the beam profile.
     aperture_factor : float, optional
         Factor by which the cropping window is larger than the current
-        diameter estimate (default 2.0).
+        diameter estimate (default 3.0).
     principal_axes_rot : bool, optional
         Whether to rotate the image to align the principal axes.  For
         non‑cylindrical beams this is recommended.

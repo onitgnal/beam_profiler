@@ -23,6 +23,7 @@ Requirements:
 * numpy
 * matplotlib
 * Pillow (for BMP loading)
+* SciPy (beam_analysis dependencies)
 * beam_analysis.py located in the same directory or installed on the
   Python path
 
@@ -47,8 +48,8 @@ def main(image_path: str) -> None:
         Path to the BMP image containing the beam profile.
     """
     # Load the BMP image and convert to grayscale
-    img = Image.open(image_path).convert("L")
-    data = np.array(img, dtype=float)
+    with Image.open(image_path) as img:
+        data = np.asarray(img.convert("L"), dtype=float)
 
     # Run the beam analysis; adjust aperture_factor here if necessary
     result = analyze_beam(data)
@@ -72,10 +73,13 @@ def main(image_path: str) -> None:
     # Plot Ix
     axes[0].plot(x_positions, Ix, label="Ix (integrated)", color="C0")
     axes[0].plot(x_positions, Ix_fit, label=f"Gaussian fit (w={fit_x['radius']:.2f} px)", color="C1")
-    # Indicate second moment radius (2σ) for the major axis on the x spectrum
+    # Indicate second moment radius (2σ) on the x spectrum
     cx = result["cx"]
     rx_iso = result["rx_iso"]
-    axes[0].axvline(cx - rx_iso, linestyle="--", color="C2", alpha=0.7, label=f"ISO rₓ={rx_iso:.2f} px")
+    ry_iso = result["ry_iso"]
+    is_major_x = rx_iso >= ry_iso
+    x_label = "ISO rₓ (major)" if is_major_x else "ISO rₓ (minor)"
+    axes[0].axvline(cx - rx_iso, linestyle="--", color="C2", alpha=0.7, label=f"{x_label} = {rx_iso:.2f} px")
     axes[0].axvline(cx + rx_iso, linestyle="--", color="C2", alpha=0.7)
     axes[0].set_xlabel("X position (pixels)")
     axes[0].set_ylabel("Integrated intensity")
@@ -85,10 +89,10 @@ def main(image_path: str) -> None:
     # Plot Iy
     axes[1].plot(y_positions, Iy, label="Iy (integrated)", color="C0")
     axes[1].plot(y_positions, Iy_fit, label=f"Gaussian fit (w={fit_y['radius']:.2f} px)", color="C1")
-    # Indicate second moment radius (2σ) for the minor axis on the y spectrum
+    # Indicate second moment radius (2σ) on the y spectrum
     cy = result["cy"]
-    ry_iso = result["ry_iso"]
-    axes[1].axvline(cy - ry_iso, linestyle="--", color="C2", alpha=0.7, label=f"ISO rᵧ={ry_iso:.2f} px")
+    y_label = "ISO rᵧ (major)" if not is_major_x else "ISO rᵧ (minor)"
+    axes[1].axvline(cy - ry_iso, linestyle="--", color="C2", alpha=0.7, label=f"{y_label} = {ry_iso:.2f} px")
     axes[1].axvline(cy + ry_iso, linestyle="--", color="C2", alpha=0.7)
     axes[1].set_xlabel("Y position (pixels)")
     axes[1].set_ylabel("Integrated intensity")
@@ -110,6 +114,7 @@ def main(image_path: str) -> None:
 
     from matplotlib.patches import Ellipse
     # ISO ellipse: second moment radii (major/minor) and orientation
+    # theta is the principal axis angle in the original image frame
     theta = result["theta"]  # rotation angle in radians
     # width and height are diameters (2*radius)
     iso_width = 2.0 * rx_iso
@@ -145,25 +150,26 @@ def main(image_path: str) -> None:
     )
     ax_img.add_patch(gauss_ellipse)
 
-    # Principal axes lines
-    length_x = rx_iso  # length scaled to ISO radii
-    length_y = ry_iso
-    # End points of the major axis
-    x0 = cx - length_x * np.cos(theta)
-    x1 = cx + length_x * np.cos(theta)
-    y0 = cy - length_x * np.sin(theta)
-    y1 = cy + length_x * np.sin(theta)
+    # Principal axes lines (use correct major/minor lengths)
+    major_len = max(rx_iso, ry_iso)
+    minor_len = min(rx_iso, ry_iso)
+    # Major axis direction: along theta
+    x0 = cx - major_len * np.cos(theta)
+    x1 = cx + major_len * np.cos(theta)
+    y0 = cy - major_len * np.sin(theta)
+    y1 = cy + major_len * np.sin(theta)
     ax_img.plot([x0, x1], [y0, y1], color="cyan", linewidth=1.5, label="Major axis")
-    # End points of the minor axis
-    x0m = cx - length_y * np.sin(theta)
-    x1m = cx + length_y * np.sin(theta)
-    y0m = cy + length_y * np.cos(theta)
-    y1m = cy - length_y * np.cos(theta)
+    # Minor axis direction: orthogonal to theta
+    x0m = cx - minor_len * np.sin(theta)
+    x1m = cx + minor_len * np.sin(theta)
+    y0m = cy + minor_len * np.cos(theta)
+    y1m = cy - minor_len * np.cos(theta)
     ax_img.plot([x0m, x1m], [y0m, y1m], color="magenta", linewidth=1.5, label="Minor axis")
 
     ax_img.legend(loc="upper right")
     ax_img.set_xlim(0, data.shape[1] - 1)
-    ax_img.set_ylim(data.shape[0] - 1, 0)
+    # origin='upper' already places (0,0) at the top-left; no ylim flip needed
+    ax_img.set_aspect('equal')
     fig2.tight_layout()
     plt.show()
 
