@@ -35,6 +35,9 @@ The main entry point is :func:`analyze_beam`, which accepts a 2D image
 * ``Ix_spectrum`` and ``Iy_spectrum`` – one‑dimensional cuts through
   the beam along the principal axes after the final iteration, as
   ``(x_positions, intensity)`` and ``(y_positions, intensity)`` arrays.
+* ``img_for_spec`` – the 2D image (rotated if necessary) used to compute
+  the spectra.  This corresponds to the final processed region of
+  interest and is convenient for plotting or further analysis.
 * ``gauss_fit_x`` and ``gauss_fit_y`` – dictionaries containing
   the best‑fit parameters ``A``, ``centre`` and ``radius`` for the
   Gaussian fits to ``Ix_spectrum`` and ``Iy_spectrum``.
@@ -511,8 +514,10 @@ def analyze_beam(
     Returns
     -------
     result : dict
-        Dictionary containing the beam parameters.  See description at
-        the top of this module for details.
+        Dictionary containing the beam parameters and helper data.  See
+        the module level documentation for the list of keys, including
+        ``img_for_spec`` which holds the 2D image used to build the
+        spectra.
     """
     # run ISO second‑moment analysis
     iso_result = iso_second_moment(
@@ -545,19 +550,14 @@ def analyze_beam(
     # typical beam analysis to ensure the integrated profiles are
     # non‑negative.  This is consistent with the MATLAB implementation
     # which subtracts a constant background but does not allow the sum
-    # over an axis to become negative【881670830533059†screenshot】.
-    #img_clipped = np.clip(img_for_spec, 0.0, None)
-    # compute 1D spectra (integrated profiles)
+    # over an axis to become negative.
+    # Compute 1D spectra (integrated profiles) directly from the
+    # processed image; any signed residuals after background subtraction
+    # are preserved so downstream consumers can reason about the noise
+    # floor if needed.
     Ix = img_for_spec.sum(axis=0)
     Iy = img_for_spec.sum(axis=1)
-    # baseline subtraction: remove any constant offset by subtracting the
-    # minimum of each spectrum.  Real beam profiles should be non‑negative
-    # and decay to a baseline; subtracting the minimum helps the Gaussian
-    # fit ignore residual background.  Without this step the fit may
-    # return an unrealistically small radius when the tail dominates.
-    #Ix = Ix - Ix.min()
-    #Iy = Iy - Iy.min()
-    # initial guesses for Gaussian fit using ISO results
+        # initial guesses for Gaussian fit using ISO results
     # amplitude guess: max value of spectrum
     # centre guess: ISO centroid along each axis
     # radius guess: second moment radii (rx, ry)

@@ -39,6 +39,7 @@ from pathlib import Path
 
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib import colors as mcolors
 from PIL import Image
 
 from typing import Optional
@@ -165,12 +166,37 @@ def main(image_path: str, pixel_size: Optional[float] = None, pixel_unit: str = 
     # ------------------------------------------------------------------
     # Plot the input image with ellipses and principal axes
     # ------------------------------------------------------------------
-    # Display the original image in a new figure
+    # Display the processed image used for the spectra in a new figure
     fig2, ax_img = plt.subplots(figsize=(6, 6))
-    display_cmap = plt.cm.get_cmap("jet", 256).copy()
+    processed_display = result["img_for_spec"]
+    base_cmap = plt.cm.get_cmap("jet", 256)
+    cmap_colors = base_cmap(np.linspace(0, 1, 256))
+    min_val = float(processed_display.min())
+    max_val = float(processed_display.max())
+    limit = abs(min_val) if min_val < 0 else 0.0
+    if limit > 0 and max_val > 0:
+        threshold = min(limit, max_val)
+        if threshold > 0:
+            # map data range [0, max_val] onto colormap indices and set the
+            # low-positive band up to ``threshold`` to grey to match the spec.
+            threshold_idx = int(np.clip(np.floor((threshold / max_val) * 255.0), 0, 255))
+            cmap_colors[: threshold_idx + 1] = np.array([0.5, 0.5, 0.5, 1.0])
+    display_cmap = mcolors.ListedColormap(cmap_colors)
     display_cmap.set_under("white")
-    vmin = 0.0 if data.min() < 0 else None
-    ax_img.imshow(data, cmap=display_cmap, origin="upper", vmin=vmin)
+    vmin = 0.0 if min_val < 0 else None
+    vmax = max_val if max_val > 0 else None
+    x_min_display = x_positions[0]
+    x_max_display = x_positions[-1]
+    y_min_display = y_positions[-1]
+    y_max_display = y_positions[0]
+    ax_img.imshow(
+        processed_display,
+        cmap=display_cmap,
+        origin="upper",
+        extent=(x_min_display, x_max_display, y_min_display, y_max_display),
+        vmin=vmin,
+        vmax=vmax,
+    )
     ax_img.set_title("Beam profile with ISO and Gaussian ellipses")
     ax_img.set_xlabel("X (pixels)")
     ax_img.set_ylabel("Y (pixels)")
@@ -230,8 +256,9 @@ def main(image_path: str, pixel_size: Optional[float] = None, pixel_unit: str = 
     ax_img.plot([x0m, x1m], [y0m, y1m], color="magenta", linewidth=1.5, label="Minor axis")
 
     ax_img.legend(loc="upper right")
-    ax_img.set_xlim(0, data.shape[1] - 1)
-    # origin='upper' already places (0,0) at the top-left; no ylim flip needed
+    ax_img.set_xlim(x_min_display, x_max_display)
+    ax_img.set_ylim(y_min_display, y_max_display)
+    # origin='upper' already places the minimum y at the top through extent
     ax_img.set_aspect('equal')
     if pixel_size is not None:
         def px_to_phys_img_x(x_value: float) -> float:
