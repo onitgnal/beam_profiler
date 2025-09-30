@@ -70,49 +70,83 @@ __all__ = [
 def bg_subtract(img: ArrayLike) -> np.ndarray:
     """Robustly subtract the background from an image.
 
-    This function implements the same strategy as the MATLAB function
-    ``BGsub`` (see ``M2tool.m``) which estimates the background from the
-    outer 5 % of the image and iteratively sigma‑clips the corner
-    pixels【881670830533059†screenshot】.  The median of the remaining corner pixels is
-    subtracted from the entire image.  The returned array retains the
-    original dtype.
+    The background level is estimated from the outer 5 % border of the
+    frame. Instead of removing a single scalar offset, we fit an affine
+    plane ``a*x + b*y + c`` to the border pixels by means of iterative
+    sigma clipping and subtract the fitted plane from the full image.
+    This allows slowly varying backgrounds to be removed while retaining
+    robustness against outliers along the border. The returned array is
+    provided as ``float64``.
 
     Parameters
     ----------
     img : array_like
-        2D array representing the image.  The values are converted to
+        2D array representing the image. The values are converted to
         floating point internally.
 
     Returns
     -------
     np.ndarray
-        The background‑subtracted image as ``float64``.
+        The background-subtracted image as ``float64``.
     """
     arr = np.asarray(img, dtype=np.float64)
     h, w = arr.shape
-    # use 5 % of the smallest dimension as border width (m in the MATLAB code)
+    if h == 0 or w == 0:
+        return arr.copy()
+
     m = int(np.ceil(0.05 * min(h, w)))
     if m < 1:
-        return arr - np.median(arr)
-    # extract corner blocks: top/bottom m rows and left/right m columns
-    corners = arr[:m, :m].ravel().tolist()
-    corners += arr[:m, -m:].ravel().tolist()
-    corners += arr[-m:, :m].ravel().tolist()
-    corners += arr[-m:, -m:].ravel().tolist()
-    b = np.array(corners, dtype=np.float64)
-    # sigma clipping: three iterations of clipping at ±3·max(σ, eps) around the median
-    for _ in range(3):
-        mu = np.median(b)
-        mad_raw = np.median(np.abs(b - mu))
-        sig = 1.4826 * mad_raw  # robust MAD to sigma
-        thresh = 3.0 * max(sig, np.finfo(float).eps)
-        mask = np.abs(b - mu) < thresh
-        if not np.any(mask):
-            break
-        b = b[mask]
-    bg = np.median(b)
-    return arr - bg
+        finite = np.isfinite(arr)
+        if not finite.any():
+            return arr.copy()
+        return arr - np.median(arr[finite])
 
+    border_mask = np.zeros((h, w), dtype=bool)
+    border_mask[:m, :] = True
+    border_mask[-m:, :] = True
+    border_mask[:, :m] = True
+    border_mask[:, -m:] = True
+
+    y_indices, x_indices = np.indices(arr.shape)
+    x = x_indices[border_mask].astype(np.float64)
+    y = y_indices[border_mask].astype(np.float64)
+    z = arr[border_mask]
+
+    finite = np.isfinite(z)
+    x = x[finite]
+    y = y[finite]
+    z = z[finite]
+
+    if z.size == 0:
+        return arr.copy()
+    if z.size < 3:
+        return arr - np.median(z)
+
+    A = np.column_stack((x, y, np.ones_like(x)))
+    params = None
+    for _ in range(3):
+        sol, *_ = np.linalg.lstsq(A, z, rcond=None)
+        params = sol
+        residuals = z - A @ params
+        res_med = np.median(residuals)
+        mad_raw = np.median(np.abs(residuals - res_med))
+        sigma = 1.4826 * mad_raw
+        thresh = 3.0 * max(sigma, np.finfo(float).eps)
+        mask = np.abs(residuals - res_med) < thresh
+        if mask.all():
+            break
+        if mask.sum() < 3:
+            break
+        A = A[mask]
+        x = x[mask]
+        y = y[mask]
+        z = z[mask]
+
+    if params is None:
+        return arr - np.median(z)
+
+    bg_plane = params[0] * x_indices + params[1] * y_indices + params[2]
+    return arr - bg_plane
 
 def estimate_background_edge_ring(img: ArrayLike) -> float:
     """Estimate background from an edge ring with robust clipping.
