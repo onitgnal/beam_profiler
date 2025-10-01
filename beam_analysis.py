@@ -53,10 +53,13 @@ from __future__ import annotations
 
 import numpy as np
 from numpy.typing import ArrayLike
+from concurrent.futures import ProcessPoolExecutor
 from scipy.ndimage import gaussian_filter
 from scipy.ndimage import rotate as nd_rotate
 from scipy.optimize import curve_fit
-from typing import Dict, Tuple, Optional, Literal
+from typing import Dict, Tuple, Optional, Literal, Union, Iterable, List
+
+ClipMode = Literal["none", "zero", "otsu"]
 
 __all__ = [
     "bg_subtract",
@@ -65,13 +68,76 @@ __all__ = [
     "fit_gaussian",
     "iso_second_moment",
     "analyze_beam",
+    "analyze_beam_batch",
 ]
+
+
+def _resolve_clip_mode(value: Union[bool, str, None], *, default: ClipMode = "none") -> ClipMode:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return "zero" if value else "none"
+    mode = value.lower()
+    if mode == "true":
+        mode = "zero"
+    if mode not in {"none", "zero", "otsu"}:
+        raise ValueError(f"Unsupported clip_negatives mode: {value!r}")
+    return mode  # type: ignore[return-value]
+
+
+def _apply_clip_mode(arr: np.ndarray, mode: ClipMode) -> np.ndarray:
+    if mode == "none":
+        return arr
+
+    finite_mask = np.isfinite(arr)
+    if not finite_mask.any():
+        arr.fill(0.0)
+        return arr
+
+    if mode == "zero":
+        arr[~finite_mask] = 0.0
+        np.maximum(arr, 0.0, out=arr)
+        return arr
+
+    # mode == "otsu"
+    finite_vals = arr[finite_mask]
+    rmin = float(finite_vals.min())
+    shifted = finite_vals - rmin
+    rng = float(shifted.max())
+    if rng > 0.0:
+        hist, edges = np.histogram(shifted, bins=256, range=(0.0, rng))
+        p = hist.astype(np.float64)
+        p_sum = p.sum()
+        if p_sum > 0.0:
+            p /= p_sum
+        else:
+            p.fill(1.0 / p.size)
+        w = np.cumsum(p)
+        m = np.cumsum(p * np.arange(p.size, dtype=np.float64))
+        mt = m[-1]
+        denom = w * (1.0 - w)
+        sb2 = (mt * w - m) ** 2 / (denom + 1e-18)
+        k = int(np.nanargmax(sb2))
+        thr = 0.5 * (edges[k] + edges[k + 1])
+    else:
+        thr = 0.0
+
+    offset = rmin + thr
+    arr -= offset
+    np.maximum(arr, 0.0, out=arr)
+    arr[~finite_mask] = 0.0
+    return arr
+
+
+def _analyze_beam_worker(payload: Tuple[ArrayLike, Dict[str, object]]) -> Dict[str, object]:
+    img, kwargs = payload
+    return analyze_beam(img, **kwargs)
 
 
 def bg_subtract(
     img: ArrayLike,
     *,
-    clip_negatives: bool | Literal["zero", "otsu"] = False,
+    clip_negatives: Union[bool, str, None] = False,
 ) -> np.ndarray:
     """Robustly subtract the background from an image.
 
@@ -89,7 +155,7 @@ def bg_subtract(
         2D array representing the image. The values are converted to
         floating point internally.
 
-    clip_negatives : bool or {"zero", "otsu"}, optional
+    clip_negatives : bool or {"none", "zero", "otsu"}, optional
         Controls how negative residuals are handled after subtraction.
         ``False`` (default) keeps signed data per ISO 11146. ``True`` or
         ``"zero"`` clips only negative values. ``"otsu"`` applies an
@@ -106,65 +172,17 @@ def bg_subtract(
     arr = np.asarray(img, dtype=np.float64)
     h, w = arr.shape
 
-    if isinstance(clip_negatives, str):
-        clip_mode = clip_negatives.lower()
-        if clip_mode not in {"zero", "otsu"}:
-            raise ValueError(f"Unsupported clip_negatives mode: {clip_negatives!r}")
-    else:
-        clip_mode = "zero" if clip_negatives else "none"
-
-    def _finalize(res: np.ndarray) -> np.ndarray:
-        if clip_mode == "none":
-            return res
-
-        finite_mask = np.isfinite(res)
-        if not finite_mask.any():
-            res.fill(0.0)
-            return res
-
-        if clip_mode == "zero":
-            res[~finite_mask] = 0.0
-            np.maximum(res, 0.0, out=res)
-            return res
-
-        # clip_mode == "otsu"
-        finite_vals = res[finite_mask]
-        rmin = float(finite_vals.min())
-        shifted = finite_vals - rmin
-        rng = float(shifted.max())
-        if rng > 0.0:
-            hist, edges = np.histogram(shifted, bins=256, range=(0.0, rng))
-            p = hist.astype(np.float64)
-            p_sum = p.sum()
-            if p_sum > 0.0:
-                p /= p_sum
-            else:
-                p.fill(1.0 / p.size)
-            w = np.cumsum(p)
-            m = np.cumsum(p * np.arange(p.size, dtype=np.float64))
-            mt = m[-1]
-            denom = w * (1.0 - w)
-            sb2 = (mt * w - m) ** 2 / (denom + 1e-18)
-            k = int(np.nanargmax(sb2))
-            thr = 0.5 * (edges[k] + edges[k + 1])
-        else:
-            thr = 0.0
-
-        offset = rmin + thr
-        res -= offset
-        np.maximum(res, 0.0, out=res)
-        res[~finite_mask] = 0.0
-        return res
+    clip_mode = _resolve_clip_mode(clip_negatives)
 
     if h == 0 or w == 0:
-        return _finalize(arr.copy())
+        return _apply_clip_mode(arr.copy(), clip_mode)
 
     m = int(np.ceil(0.05 * min(h, w)))
     if m < 1:
         finite = np.isfinite(arr)
         if not finite.any():
-            return _finalize(arr.copy())
-        return _finalize(arr - np.median(arr[finite]))
+            return _apply_clip_mode(arr.copy(), clip_mode)
+        return _apply_clip_mode(arr - np.median(arr[finite]), clip_mode)
 
     border_mask = np.zeros((h, w), dtype=bool)
     border_mask[:m, :] = True
@@ -183,9 +201,9 @@ def bg_subtract(
     z = z[finite]
 
     if z.size == 0:
-        return _finalize(arr.copy())
+        return _apply_clip_mode(arr.copy(), clip_mode)
     if z.size < 3:
-        return _finalize(arr - np.median(z))
+        return _apply_clip_mode(arr - np.median(z), clip_mode)
 
     A = np.column_stack((x, y, np.ones_like(x)))
     params = None
@@ -208,10 +226,10 @@ def bg_subtract(
         z = z[mask]
 
     if params is None:
-        return _finalize(arr - np.median(z))
+        return _apply_clip_mode(arr - np.median(z), clip_mode)
 
     bg_plane = params[0] * x_indices + params[1] * y_indices + params[2]
-    return _finalize(arr - bg_plane)
+    return _apply_clip_mode(arr - bg_plane, clip_mode)
 
 def estimate_background_edge_ring(img: ArrayLike) -> float:
     """Estimate background from an edge ring with robust clipping.
@@ -410,8 +428,8 @@ def iso_second_moment(
     img: ArrayLike,
     aperture_factor: float = 3.0,
     principal_axes_rot: bool = True,
-    clip_negatives: bool | Literal["zero", "otsu"] = False,
-    angle_clip_mode: bool | Literal["zero", "otsu"] | None = "otsu",
+    clip_negatives: Union[bool, str, None] = False,
+    angle_clip_mode: Union[bool, str, None] = "otsu",
     tol: float = 1,
     max_iterations: int = 100,
 ) -> Dict[str, object]:
@@ -436,12 +454,12 @@ def iso_second_moment(
         If ``True``, return radii along the principal axes by rotating the
         final cropped image.  If ``False``, the returned radii are along
         the image axes.
-    clip_negatives : bool or {"zero", "otsu"}, optional
+    clip_negatives : bool or {"none", "zero", "otsu"}, optional
         Forwarded to :func:`bg_subtract` for second-moment radii and the
         spectra. ``False`` retains signed data. ``True``/``"zero"`` clips
         negative values. ``"otsu"`` applies an additional Otsu-derived
         floor before clipping.
-    angle_clip_mode : bool or {"zero", "otsu"}, optional
+    angle_clip_mode : bool or {"none", "zero", "otsu"}, optional
         Background handling for the principal-axis angle estimation. By
         default ``"otsu"`` is used to stabilise the angle while keeping the
         second-moment computation un-clipped. ``None`` reuses
@@ -493,18 +511,25 @@ def iso_second_moment(
     """
     # convert to float and ensure a copy so modifications do not affect the original
     raw_img = np.asarray(img, dtype=np.float64)
-    # One-time global background subtraction to match M2tool's behavior
-    full_img = bg_subtract(raw_img, clip_negatives=clip_negatives)
+    # Base background subtraction (no clipping) then apply clipping modes in-place
+    full_img_base = bg_subtract(raw_img, clip_negatives="none")
 
-    if angle_clip_mode is None:
-        angle_mode = clip_negatives
+    clip_mode = _resolve_clip_mode(clip_negatives)
+    angle_mode = _resolve_clip_mode(angle_clip_mode, default=clip_mode)
+
+    if clip_mode == "none":
+        full_img = full_img_base
     else:
-        angle_mode = angle_clip_mode
+        full_img = full_img_base.copy()
+        _apply_clip_mode(full_img, clip_mode)
 
-    if angle_mode == clip_negatives:
+    if angle_mode == clip_mode:
         full_img_angle = full_img
+    elif angle_mode == "none":
+        full_img_angle = full_img_base
     else:
-        full_img_angle = bg_subtract(raw_img, clip_negatives=angle_mode)
+        full_img_angle = full_img_base.copy()
+        _apply_clip_mode(full_img_angle, angle_mode)
 
     ny, nx = full_img.shape
     # initial centre: use smoothed image to avoid hot pixels
@@ -550,13 +575,21 @@ def iso_second_moment(
         ymax = min(ymax, ny - 1)
         # extract and subtract background on the crop as in M2tool (corner-based BGsub)
         cropped = full_img[ymin:ymax + 1, xmin:xmax + 1]
-        processed = bg_subtract(cropped, clip_negatives=clip_negatives)
+        cropped_base = bg_subtract(cropped, clip_negatives="none")
 
-        if full_img_angle is full_img:
-            processed_angle = processed
+        if clip_mode == "none":
+            processed = cropped_base
         else:
-            cropped_angle = full_img_angle[ymin:ymax + 1, xmin:xmax + 1]
-            processed_angle = bg_subtract(cropped_angle, clip_negatives=angle_mode)
+            processed = cropped_base.copy()
+            _apply_clip_mode(processed, clip_mode)
+
+        if angle_mode == clip_mode:
+            processed_angle = processed
+        elif angle_mode == "none":
+            processed_angle = cropped_base
+        else:
+            processed_angle = cropped_base.copy()
+            _apply_clip_mode(processed_angle, angle_mode)
 
         # compute second moment radii and centroid in the cropped frame
         rx_new, ry_new, cx_local, cy_local, _ = get_beam_size(processed)
@@ -670,8 +703,8 @@ def analyze_beam(
     img: ArrayLike,
     aperture_factor: float = 3.0,
     principal_axes_rot: bool = True,
-    clip_negatives: bool | Literal["zero", "otsu"] = False,
-    angle_clip_mode: bool | Literal["zero", "otsu"] | None = "otsu",
+    clip_negatives: Union[bool, str, None] = False,
+    angle_clip_mode: Union[bool, str, None] = "otsu",
     tol: float = 0.5,
     max_iterations: int = 100,
 ) -> Dict[str, object]:
@@ -692,11 +725,11 @@ def analyze_beam(
     principal_axes_rot : bool, optional
         Whether to rotate the image to align the principal axes.  For
         non‑cylindrical beams this is recommended.
-    clip_negatives : bool or {"zero", "otsu"}, optional
+    clip_negatives : bool or {"none", "zero", "otsu"}, optional
         Forwarded to :func:`iso_second_moment`. ``False`` retains signed
         data. ``True``/``"zero"`` clips negatives, while ``"otsu"`` applies
         an additional Otsu-derived floor before clipping.
-    angle_clip_mode : bool or {"zero", "otsu"}, optional
+    angle_clip_mode : bool or {"none", "zero", "otsu"}, optional
         Mode used internally for the principal-axis estimation. Defaults
         to ``"otsu"`` for robust angle determination. ``None`` reuses
         ``clip_negatives``.
@@ -792,3 +825,45 @@ def analyze_beam(
         },
         "iterations": iso_result["iterations"],
     }
+
+
+def analyze_beam_batch(
+    images: Iterable[ArrayLike],
+    *,
+    max_workers: Optional[int] = None,
+    chunksize: int = 1,
+    **analyze_kwargs: object,
+) -> List[Dict[str, object]]:
+    """Analyse multiple frames in parallel using all available CPU cores.
+
+    Parameters
+    ----------
+    images : iterable of array_like
+        Sequence of 2D beam images.
+    max_workers : int, optional
+        Number of processes to spawn. Defaults to ``os.cpu_count()``.
+    chunksize : int, optional
+        Chunk size hint forwarded to :class:`ProcessPoolExecutor`. Larger
+        values reduce scheduling overhead for large batches.
+    **analyze_kwargs : dict
+        Additional keyword arguments passed to :func:`analyze_beam` for
+        each frame.
+
+    Returns
+    -------
+    list of dict
+        Results from :func:`analyze_beam`, ordered to match ``images``.
+    """
+    images_list = list(images)
+    if not images_list:
+        return []
+
+    if chunksize < 1:
+        raise ValueError("chunksize must be >= 1")
+
+    # Ensure inputs are NumPy arrays prior to pickling for worker processes
+    payloads = [(frame, analyze_kwargs) for frame in images_list]
+
+    with ProcessPoolExecutor(max_workers=max_workers) as pool:
+        results = list(pool.map(_analyze_beam_worker, payloads, chunksize=chunksize))
+    return results
