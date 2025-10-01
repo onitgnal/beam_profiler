@@ -35,9 +35,10 @@ The main entry point is :func:`analyze_beam`, which accepts a 2D image
 * ``Ix_spectrum`` and ``Iy_spectrum`` – one‑dimensional cuts through
   the beam along the principal axes after the final iteration, as
   ``(x_positions, intensity)`` and ``(y_positions, intensity)`` arrays.
-* ``img_for_spec`` – the 2D image (rotated if necessary) used to compute
-  the spectra.  This corresponds to the final processed region of
-  interest and is convenient for plotting or further analysis.
+* ``img_for_spec`` – the final processed region of interest in the input
+  orientation, suitable for plotting without additional rotations.
+* ``img_for_spec_origin`` – ``(ymin, xmin)`` coordinates of the
+  top‑left pixel of ``img_for_spec`` within the original input image.
 * ``gauss_fit_x`` and ``gauss_fit_y`` – dictionaries containing
   the best‑fit parameters ``A``, ``centre`` and ``radius`` for the
   Gaussian fits to ``Ix_spectrum`` and ``Iy_spectrum``.
@@ -55,7 +56,7 @@ from numpy.typing import ArrayLike
 from scipy.ndimage import gaussian_filter
 from scipy.ndimage import rotate as nd_rotate
 from scipy.optimize import curve_fit
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple, Optional, Literal
 
 __all__ = [
     "bg_subtract",
@@ -67,7 +68,11 @@ __all__ = [
 ]
 
 
-def bg_subtract(img: ArrayLike) -> np.ndarray:
+def bg_subtract(
+    img: ArrayLike,
+    *,
+    clip_negatives: bool | Literal["zero", "otsu"] = False,
+) -> np.ndarray:
     """Robustly subtract the background from an image.
 
     The background level is estimated from the outer 5 % border of the
@@ -84,22 +89,82 @@ def bg_subtract(img: ArrayLike) -> np.ndarray:
         2D array representing the image. The values are converted to
         floating point internally.
 
+    clip_negatives : bool or {"zero", "otsu"}, optional
+        Controls how negative residuals are handled after subtraction.
+        ``False`` (default) keeps signed data per ISO 11146. ``True`` or
+        ``"zero"`` clips only negative values. ``"otsu"`` applies an
+        Otsu-derived constant floor before clipping to zero. ISO 11146
+        recommends keeping negative samples; clipping can be enabled for
+        improved robustness on noisy data.
+
     Returns
     -------
     np.ndarray
-        The background-subtracted image as ``float64``.
+        The background-subtracted image as ``float64``. Negative clipping
+        is only applied when ``clip_negatives`` is ``True``.
     """
     arr = np.asarray(img, dtype=np.float64)
     h, w = arr.shape
+
+    if isinstance(clip_negatives, str):
+        clip_mode = clip_negatives.lower()
+        if clip_mode not in {"zero", "otsu"}:
+            raise ValueError(f"Unsupported clip_negatives mode: {clip_negatives!r}")
+    else:
+        clip_mode = "zero" if clip_negatives else "none"
+
+    def _finalize(res: np.ndarray) -> np.ndarray:
+        if clip_mode == "none":
+            return res
+
+        finite_mask = np.isfinite(res)
+        if not finite_mask.any():
+            res.fill(0.0)
+            return res
+
+        if clip_mode == "zero":
+            res[~finite_mask] = 0.0
+            np.maximum(res, 0.0, out=res)
+            return res
+
+        # clip_mode == "otsu"
+        finite_vals = res[finite_mask]
+        rmin = float(finite_vals.min())
+        shifted = finite_vals - rmin
+        rng = float(shifted.max())
+        if rng > 0.0:
+            hist, edges = np.histogram(shifted, bins=256, range=(0.0, rng))
+            p = hist.astype(np.float64)
+            p_sum = p.sum()
+            if p_sum > 0.0:
+                p /= p_sum
+            else:
+                p.fill(1.0 / p.size)
+            w = np.cumsum(p)
+            m = np.cumsum(p * np.arange(p.size, dtype=np.float64))
+            mt = m[-1]
+            denom = w * (1.0 - w)
+            sb2 = (mt * w - m) ** 2 / (denom + 1e-18)
+            k = int(np.nanargmax(sb2))
+            thr = 0.5 * (edges[k] + edges[k + 1])
+        else:
+            thr = 0.0
+
+        offset = rmin + thr
+        res -= offset
+        np.maximum(res, 0.0, out=res)
+        res[~finite_mask] = 0.0
+        return res
+
     if h == 0 or w == 0:
-        return arr.copy()
+        return _finalize(arr.copy())
 
     m = int(np.ceil(0.05 * min(h, w)))
     if m < 1:
         finite = np.isfinite(arr)
         if not finite.any():
-            return arr.copy()
-        return arr - np.median(arr[finite])
+            return _finalize(arr.copy())
+        return _finalize(arr - np.median(arr[finite]))
 
     border_mask = np.zeros((h, w), dtype=bool)
     border_mask[:m, :] = True
@@ -118,9 +183,9 @@ def bg_subtract(img: ArrayLike) -> np.ndarray:
     z = z[finite]
 
     if z.size == 0:
-        return arr.copy()
+        return _finalize(arr.copy())
     if z.size < 3:
-        return arr - np.median(z)
+        return _finalize(arr - np.median(z))
 
     A = np.column_stack((x, y, np.ones_like(x)))
     params = None
@@ -143,10 +208,10 @@ def bg_subtract(img: ArrayLike) -> np.ndarray:
         z = z[mask]
 
     if params is None:
-        return arr - np.median(z)
+        return _finalize(arr - np.median(z))
 
     bg_plane = params[0] * x_indices + params[1] * y_indices + params[2]
-    return arr - bg_plane
+    return _finalize(arr - bg_plane)
 
 def estimate_background_edge_ring(img: ArrayLike) -> float:
     """Estimate background from an edge ring with robust clipping.
@@ -195,6 +260,57 @@ def estimate_background_edge_ring(img: ArrayLike) -> float:
 
 
 def get_beam_size(profile: ArrayLike) -> Tuple[float, float, float, float, float]:
+    """Return ISO second-moment radii and centroid for a beam profile.
+
+    Parameters
+    ----------
+    profile : array_like
+        Background-subtracted 2D intensity distribution. Optional
+        negative-value clipping should be handled upstream.
+
+    Returns
+    -------
+    tuple of float
+        ``(rx, ry, cx, cy, phi)`` where ``phi`` is the major principal
+        axis angle in radians, counter-clockwise from +x in laboratory
+        coordinates (y up).
+    """
+    I = np.asarray(profile, dtype=np.float64)
+    if I.size == 0:
+        return 0.0, 0.0, 0.0, 0.0, 0.0
+    if not np.isfinite(I).all():
+        I = np.nan_to_num(I, nan=0.0, posinf=0.0, neginf=0.0)
+
+    total = I.sum()
+    if total <= 0.0:
+        return 0.0, 0.0, 0.0, 0.0, 0.0
+
+    y_indices, x_indices = np.indices(I.shape, dtype=np.float64)
+    cx = float((I * x_indices).sum() / total)
+    cy = float((I * y_indices).sum() / total)
+
+    dx = x_indices - cx
+    dy = y_indices - cy
+    sigma_x_sq = float((I * dx ** 2).sum() / total)
+    sigma_y_sq = float((I * dy ** 2).sum() / total)
+    sigma_xy = float((I * dx * dy).sum() / total)
+
+    rx = 2.0 * np.sqrt(max(sigma_x_sq, 0.0))
+    ry = 2.0 * np.sqrt(max(sigma_y_sq, 0.0))
+
+    cov = np.array([[sigma_x_sq, sigma_xy], [sigma_xy, sigma_y_sq]], dtype=np.float64)
+    evals, evecs = np.linalg.eigh(cov)
+    major_axis = evecs[:, int(np.argmax(evals))]
+
+    theta_img = float(np.arctan2(major_axis[1], major_axis[0]))
+    phi = (-theta_img + np.pi) % np.pi
+    if phi > np.pi / 2:
+        phi -= np.pi
+
+    return float(rx), float(ry), cx, cy, -float(phi)
+
+
+def get_beam_size_old(profile: ArrayLike) -> Tuple[float, float, float, float, float]:
     """Compute second‑moment beam parameters.
 
     Given a 2D intensity distribution ``profile``, this function
@@ -228,6 +344,7 @@ def get_beam_size(profile: ArrayLike) -> Tuple[float, float, float, float, float
         x‑axis.
     """
     arr = np.asarray(profile, dtype=np.float64)
+    
     # compute sums and coordinate grids
     y_indices, x_indices = np.indices(arr.shape)
     total_intensity = arr.sum()
@@ -248,7 +365,8 @@ def get_beam_size(profile: ArrayLike) -> Tuple[float, float, float, float, float
     # horizontal and vertical moments are equal the principal axes are
     # ±45 degrees depending on the sign of sigma_xy【881670830533059†screenshot】.
     if sigma_x_sq != sigma_y_sq:
-        phi = 0.5 * np.arctan2(2.0 * sigma_xy, (sigma_x_sq - sigma_y_sq))
+        #phi = 0.5 * np.arctan2(2.0 * sigma_xy, (sigma_x_sq - sigma_y_sq))
+        phi = 0.5 * np.arctan2(2 * np.sign(sigma_xy) * np.abs(sigma_xy),(sigma_x_sq - sigma_y_sq))
     else:
         phi = 0.25 * np.pi * np.sign(sigma_xy) if sigma_xy != 0 else 0.0
     return rx, ry, cx, cy, phi
@@ -292,6 +410,8 @@ def iso_second_moment(
     img: ArrayLike,
     aperture_factor: float = 3.0,
     principal_axes_rot: bool = True,
+    clip_negatives: bool | Literal["zero", "otsu"] = False,
+    angle_clip_mode: bool | Literal["zero", "otsu"] | None = "otsu",
     tol: float = 1,
     max_iterations: int = 100,
 ) -> Dict[str, object]:
@@ -316,6 +436,16 @@ def iso_second_moment(
         If ``True``, return radii along the principal axes by rotating the
         final cropped image.  If ``False``, the returned radii are along
         the image axes.
+    clip_negatives : bool or {"zero", "otsu"}, optional
+        Forwarded to :func:`bg_subtract` for second-moment radii and the
+        spectra. ``False`` retains signed data. ``True``/``"zero"`` clips
+        negative values. ``"otsu"`` applies an additional Otsu-derived
+        floor before clipping.
+    angle_clip_mode : bool or {"zero", "otsu"}, optional
+        Background handling for the principal-axis angle estimation. By
+        default ``"otsu"`` is used to stabilise the angle while keeping the
+        second-moment computation un-clipped. ``None`` reuses
+        ``clip_negatives``.
     tol : float, optional
         Convergence tolerance in pixels.  The iterations stop when the
         sum of absolute differences of the radii between successive
@@ -362,9 +492,20 @@ def iso_second_moment(
             provided if ``rotated_img`` is not ``None``.
     """
     # convert to float and ensure a copy so modifications do not affect the original
-    full_img = np.asarray(img, dtype=np.float64)
+    raw_img = np.asarray(img, dtype=np.float64)
     # One-time global background subtraction to match M2tool's behavior
-    full_img = bg_subtract(full_img)
+    full_img = bg_subtract(raw_img, clip_negatives=clip_negatives)
+
+    if angle_clip_mode is None:
+        angle_mode = clip_negatives
+    else:
+        angle_mode = angle_clip_mode
+
+    if angle_mode == clip_negatives:
+        full_img_angle = full_img
+    else:
+        full_img_angle = bg_subtract(raw_img, clip_negatives=angle_mode)
+
     ny, nx = full_img.shape
     # initial centre: use smoothed image to avoid hot pixels
     smoothed = gaussian_filter(full_img, sigma=2.0)
@@ -409,9 +550,18 @@ def iso_second_moment(
         ymax = min(ymax, ny - 1)
         # extract and subtract background on the crop as in M2tool (corner-based BGsub)
         cropped = full_img[ymin:ymax + 1, xmin:xmax + 1]
-        processed = bg_subtract(cropped)
+        processed = bg_subtract(cropped, clip_negatives=clip_negatives)
+
+        if full_img_angle is full_img:
+            processed_angle = processed
+        else:
+            cropped_angle = full_img_angle[ymin:ymax + 1, xmin:xmax + 1]
+            processed_angle = bg_subtract(cropped_angle, clip_negatives=angle_mode)
+
         # compute second moment radii and centroid in the cropped frame
-        rx_new, ry_new, cx_local, cy_local, phi = get_beam_size(processed)
+        rx_new, ry_new, cx_local, cy_local, _ = get_beam_size(processed)
+        # principal-axis angle from the Otsu-clipped data for robustness
+        _, _, _, _, phi = get_beam_size(processed_angle)
         # update global centre coordinates
         cx = cx_local + xmin
         cy = cy_local + ymin
@@ -470,7 +620,7 @@ def iso_second_moment(
                     full_img[y_in_start:y_in_end, x_in_start:x_in_end]
                 )
 
-            expanded_processed = bg_subtract(expanded_patch)
+            expanded_processed = bg_subtract(expanded_patch, clip_negatives=clip_negatives)
             y_insert_end = y_offset + h_old
             x_insert_end = x_offset + w_old
             expanded_processed[y_offset:y_insert_end, x_offset:x_insert_end] = processed_img
@@ -520,6 +670,8 @@ def analyze_beam(
     img: ArrayLike,
     aperture_factor: float = 3.0,
     principal_axes_rot: bool = True,
+    clip_negatives: bool | Literal["zero", "otsu"] = False,
+    angle_clip_mode: bool | Literal["zero", "otsu"] | None = "otsu",
     tol: float = 0.5,
     max_iterations: int = 100,
 ) -> Dict[str, object]:
@@ -540,6 +692,14 @@ def analyze_beam(
     principal_axes_rot : bool, optional
         Whether to rotate the image to align the principal axes.  For
         non‑cylindrical beams this is recommended.
+    clip_negatives : bool or {"zero", "otsu"}, optional
+        Forwarded to :func:`iso_second_moment`. ``False`` retains signed
+        data. ``True``/``"zero"`` clips negatives, while ``"otsu"`` applies
+        an additional Otsu-derived floor before clipping.
+    angle_clip_mode : bool or {"zero", "otsu"}, optional
+        Mode used internally for the principal-axis estimation. Defaults
+        to ``"otsu"`` for robust angle determination. ``None`` reuses
+        ``clip_negatives``.
     tol : float, optional
         Convergence tolerance in pixels for the ISO second‑moment method.
     max_iterations : int, optional
@@ -548,50 +708,55 @@ def analyze_beam(
     Returns
     -------
     result : dict
-        Dictionary containing the beam parameters and helper data.  See
-        the module level documentation for the list of keys, including
-        ``img_for_spec`` which holds the 2D image used to build the
-        spectra.
+        Dictionary containing the beam parameters and helper data. See
+        the module level documentation for the list of keys. Notably,
+        ``img_for_spec`` holds the non-rotated cropped image (with
+        origin ``img_for_spec_origin``), while the 1D spectra remain
+        aligned to the principal axes.
     """
     # run ISO second‑moment analysis
     iso_result = iso_second_moment(
         img,
         aperture_factor=aperture_factor,
         principal_axes_rot=principal_axes_rot,
+        clip_negatives=clip_negatives,
+        angle_clip_mode=angle_clip_mode,
         tol=tol,
         max_iterations=max_iterations,
     )
-    # compute spectra along principal axes using the rotated or processed image
+    # compute spectra along principal axes using the rotated image when available
     rotated_img = iso_result["rotated_img"]
     processed_img = iso_result["processed_img"]
-    # positions relative to original image
-    if rotated_img is not None:
-        img_for_spec = rotated_img
-        # global origin for rotated image
-        ymin_rot, xmin_rot = iso_result["rotated_crop_origin"]
-        # x and y positions in original pixel coordinates
-        h_rot, w_rot = rotated_img.shape
-        x_positions = xmin_rot + np.arange(w_rot)
-        y_positions = ymin_rot + np.arange(h_rot)
+    crop_origin = iso_result["crop_origin"]
+
+    if processed_img is None or processed_img.size == 0:
+        raise ValueError("ISO analysis returned an empty processed image; cannot compute spectra.")
+
+    if rotated_img is not None and rotated_img.size > 0:
+        spectrum_img = rotated_img
+        ymin_spec, xmin_spec = iso_result["rotated_crop_origin"]
+        h_spec, w_spec = spectrum_img.shape
+        x_positions = xmin_spec + np.arange(w_spec)
+        y_positions = ymin_spec + np.arange(h_spec)
     else:
-        img_for_spec = processed_img
-        ymin, xmin = iso_result["crop_origin"]
-        h_proc, w_proc = processed_img.shape
-        x_positions = xmin + np.arange(w_proc)
-        y_positions = ymin + np.arange(h_proc)
-    # for spectral analysis negative values (arising from background
-    # subtraction) can bias the Gaussian fit.  Clip to zero as in
-    # typical beam analysis to ensure the integrated profiles are
-    # non‑negative.  This is consistent with the MATLAB implementation
-    # which subtracts a constant background but does not allow the sum
-    # over an axis to become negative.
-    # Compute 1D spectra (integrated profiles) directly from the
-    # processed image; any signed residuals after background subtraction
-    # are preserved so downstream consumers can reason about the noise
-    # floor if needed.
-    Ix = img_for_spec.sum(axis=0)
-    Iy = img_for_spec.sum(axis=1)
-        # initial guesses for Gaussian fit using ISO results
+        spectrum_img = processed_img
+        ymin_spec, xmin_spec = iso_result["crop_origin"]
+        h_spec, w_spec = spectrum_img.shape
+        x_positions = xmin_spec + np.arange(w_spec)
+        y_positions = ymin_spec + np.arange(h_spec)
+
+    # store the non-rotated image for downstream consumers (e.g. plotting)
+    img_for_spec = processed_img
+
+    # Integrated profiles along the principal axes remain based on the
+    # rotation-aligned image to keep spectra and Gaussian fits unchanged.
+    if spectrum_img is None or spectrum_img.size == 0:
+        raise ValueError("ISO analysis returned an empty spectrum image; cannot compute principal-axis spectra.")
+
+    Ix = spectrum_img.sum(axis=0)
+    Iy = spectrum_img.sum(axis=1)
+
+    # initial guesses for Gaussian fit using ISO results
     # amplitude guess: max value of spectrum
     # centre guess: ISO centroid along each axis
     # radius guess: second moment radii (rx, ry)
@@ -605,6 +770,7 @@ def analyze_beam(
     params_y, cov_y = fit_gaussian(y_positions, Iy, (Iy.max(), centre_y, max(ry, 1e-3)))
     return {
         "img_for_spec": img_for_spec,
+        "img_for_spec_origin": crop_origin,
         "theta": iso_result["phi"],
         "rx_iso": iso_result["rx"],
         "ry_iso": iso_result["ry"],

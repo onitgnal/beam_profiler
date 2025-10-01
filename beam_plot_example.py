@@ -42,7 +42,7 @@ import matplotlib.pyplot as plt
 from matplotlib import colors as mcolors
 from PIL import Image
 
-from typing import Optional
+from typing import Optional, Tuple
 
 # import the analyze_beam function from the beam_analysis module
 from beam_analysis import analyze_beam
@@ -166,9 +166,16 @@ def main(image_path: str, pixel_size: Optional[float] = None, pixel_unit: str = 
     # ------------------------------------------------------------------
     # Plot the input image with ellipses and principal axes
     # ------------------------------------------------------------------
-    # Display the processed image used for the spectra in a new figure
+    # Display the (non-rotated) processed image in a new figure
     fig2, ax_img = plt.subplots(figsize=(6, 6))
     processed_display = result["img_for_spec"]
+    img_origin = result.get("img_for_spec_origin", (0, 0))
+    ymin_img, xmin_img = img_origin
+    if processed_display.size == 0:
+        raise ValueError("Beam analysis returned an empty processed image; cannot build overlay plot.")
+    height_img, width_img = processed_display.shape
+    x_display = xmin_img + np.arange(width_img)
+    y_display = ymin_img + np.arange(height_img)
     base_cmap = plt.cm.get_cmap("jet", 256)
     cmap_colors = base_cmap(np.linspace(0, 1, 256))
     min_val = float(processed_display.min())
@@ -185,10 +192,10 @@ def main(image_path: str, pixel_size: Optional[float] = None, pixel_unit: str = 
     display_cmap.set_under("white")
     vmin = 0.0 if min_val < 0 else None
     vmax = max_val if max_val > 0 else None
-    x_min_display = x_positions[0]
-    x_max_display = x_positions[-1]
-    y_min_display = y_positions[-1]
-    y_max_display = y_positions[0]
+    x_min_display = x_display[0]
+    x_max_display = x_display[-1]
+    y_min_display = y_display[-1]
+    y_max_display = y_display[0]
     ax_img.imshow(
         processed_display,
         cmap=display_cmap,
@@ -201,59 +208,57 @@ def main(image_path: str, pixel_size: Optional[float] = None, pixel_unit: str = 
     ax_img.set_xlabel("X (pixels)")
     ax_img.set_ylabel("Y (pixels)")
 
-    from matplotlib.patches import Ellipse
-    # ISO ellipse: second moment radii (major/minor) and orientation
-    # theta is the principal axis angle in the original image frame
-    theta = result["theta"]  # rotation angle in radians
-    # width and height are diameters (2*radius)
-    iso_width = 2.0 * rx_iso
-    iso_height = 2.0 * ry_iso
-    iso_ellipse = Ellipse(
-        (cx, cy),
-        width=iso_width,
-        height=iso_height,
-        angle=np.degrees(theta),
-        edgecolor="white",
-        facecolor="none",
-        linestyle="-",
-        linewidth=2,
-        label="ISO ellipse",
-    )
-    ax_img.add_patch(iso_ellipse)
+    # Principal-axis orientation returned by the analysis is referenced to the
+    # original, non-rotated image.  Convert this angle into unit vectors that
+    # we can use directly in the display coordinate system.
+    theta = result["theta"]
+    major_radius = rx_iso
+    minor_radius = ry_iso
+    angle_image = theta
+    if ry_iso > rx_iso:
+        major_radius, minor_radius = minor_radius, major_radius
+        angle_image += 0.5 * np.pi
 
-    # Gaussian ellipse: 1/e^2 radii from Gaussian fits
+    major_vec = np.array([np.cos(angle_image), np.sin(angle_image)], dtype=float)
+    minor_vec = np.array([-np.sin(angle_image), np.cos(angle_image)], dtype=float)
+    major_norm = np.linalg.norm(major_vec)
+    minor_norm = np.linalg.norm(minor_vec)
+    if major_norm == 0.0 or minor_norm == 0.0:
+        raise ValueError("Failed to derive principal-axis directions; zero-length vector encountered.")
+    major_vec /= major_norm
+    minor_vec /= minor_norm
+
     gauss_rx = fit_x["radius"]
     gauss_ry = fit_y["radius"]
-    gauss_width = 2.0 * gauss_rx
-    gauss_height = 2.0 * gauss_ry
-    gauss_ellipse = Ellipse(
-        (cx, cy),
-        width=gauss_width,
-        height=gauss_height,
-        angle=np.degrees(theta),
-        edgecolor="yellow",
-        facecolor="none",
-        linestyle="--",
-        linewidth=2,
-        label="Gaussian ellipse",
-    )
-    ax_img.add_patch(gauss_ellipse)
+    if ry_iso > rx_iso:
+        gauss_major_radius = gauss_ry
+        gauss_minor_radius = gauss_rx
+    else:
+        gauss_major_radius = gauss_rx
+        gauss_minor_radius = gauss_ry
 
-    # Principal axes lines (use correct major/minor lengths)
-    major_len = max(rx_iso, ry_iso)
-    minor_len = min(rx_iso, ry_iso)
-    # Major axis direction: along theta
-    x0 = cx - major_len * np.cos(theta)
-    x1 = cx + major_len * np.cos(theta)
-    y0 = cy - major_len * np.sin(theta)
-    y1 = cy + major_len * np.sin(theta)
-    ax_img.plot([x0, x1], [y0, y1], color="cyan", linewidth=1.5, label="Major axis")
-    # Minor axis direction: orthogonal to theta
-    x0m = cx - minor_len * np.sin(theta)
-    x1m = cx + minor_len * np.sin(theta)
-    y0m = cy + minor_len * np.cos(theta)
-    y1m = cy - minor_len * np.cos(theta)
-    ax_img.plot([x0m, x1m], [y0m, y1m], color="magenta", linewidth=1.5, label="Minor axis")
+    def ellipse_coords(a_radius: float, b_radius: float) -> Tuple[np.ndarray, np.ndarray]:
+        t = np.linspace(0.0, 2.0 * np.pi, 361)
+        cos_t = np.cos(t)
+        sin_t = np.sin(t)
+        x_vals = cx + a_radius * cos_t * major_vec[0] + b_radius * sin_t * minor_vec[0]
+        y_vals = cy + a_radius * cos_t * major_vec[1] + b_radius * sin_t * minor_vec[1]
+        return x_vals, y_vals
+
+    iso_x, iso_y = ellipse_coords(major_radius, minor_radius)
+    gauss_x, gauss_y = ellipse_coords(gauss_major_radius, gauss_minor_radius)
+
+    ax_img.plot(iso_x, iso_y, color="white", linewidth=2.0, label="ISO ellipse")
+    ax_img.plot(gauss_x, gauss_y, color="yellow", linewidth=2.0, linestyle="--", label="Gaussian ellipse")
+
+    # Principal axis lines drawn using the eigenvectors
+    major_line_x = [cx - major_radius * major_vec[0], cx + major_radius * major_vec[0]]
+    major_line_y = [cy - major_radius * major_vec[1], cy + major_radius * major_vec[1]]
+    minor_line_x = [cx - minor_radius * minor_vec[0], cx + minor_radius * minor_vec[0]]
+    minor_line_y = [cy - minor_radius * minor_vec[1], cy + minor_radius * minor_vec[1]]
+
+    ax_img.plot(major_line_x, major_line_y, color="cyan", linewidth=1.5, label="Major axis")
+    ax_img.plot(minor_line_x, minor_line_y, color="magenta", linewidth=1.5, label="Minor axis")
 
     ax_img.legend(loc="upper right")
     ax_img.set_xlim(x_min_display, x_max_display)
