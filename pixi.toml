@@ -1,0 +1,14 @@
+[workspace]
+channels = ["conda-forge"]
+name = "beam_profiler"
+platforms = ["win-64"]
+version = "0.1.0"
+
+[tasks]
+
+[dependencies]
+numpy = ">=2.3.3,<3"
+matplotlib = ">=3.10.6,<4"
+pillow = ">=11.1.0,<12"
+scipy = ">=1.16.2,<2"
+typing = ">=3.10.0.0,<4"

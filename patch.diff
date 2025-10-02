@@ -1,0 +1,31 @@
+*** Begin Patch
+*** Update File: beam_plot_example.py
+@@
+-    # Build fitted curves for plotting
+-    def gauss_curve(x: np.ndarray, params: dict) -> np.ndarray:
+-        return params["amplitude"] * np.exp(-2.0 * ((x - params["centre"]) / params["radius"]) ** 2)
+-
+-    Ix_fit = gauss_curve(x_positions, fit_x)
+-    Iy_fit = gauss_curve(y_positions, fit_y)
++    # Build fitted curves for plotting (only when Gaussian fits are available)
++    def gauss_curve(x: np.ndarray, params: dict) -> np.ndarray:
++        return params["amplitude"] * np.exp(-2.0 * ((x - params["centre"]) / params["radius"]) ** 2)
++
++    _compute = globals().get('_beam_example_opts', {}).get('compute', 'both')
++    Ix_fit = gauss_curve(x_positions, fit_x) if (_compute in ("both", "gauss") and fit_x is not None) else None
++    Iy_fit = gauss_curve(y_positions, fit_y) if (_compute in ("both", "gauss") and fit_y is not None) else None
+@@
+-    _compute = globals().get('_beam_example_opts', {}).get('compute', 'both')
+-    if _compute in ("both", "gauss"):
+-        axes[0].plot(x_positions, Ix_fit, label=gauss_x_label, color="C1")
++    _compute = globals().get('_beam_example_opts', {}).get('compute', 'both')
++    if _compute in ("both", "gauss") and Ix_fit is not None:
++        axes[0].plot(x_positions, Ix_fit, label=gauss_x_label, color="C1")
+@@
+-    _compute = globals().get('_beam_example_opts', {}).get('compute', 'both')
+-    if _compute in ("both", "gauss"):
+-        axes[1].plot(y_positions, Iy_fit, label=gauss_y_label, color="C1")
++    _compute = globals().get('_beam_example_opts', {}).get('compute', 'both')
++    if _compute in ("both", "gauss") and Iy_fit is not None:
++        axes[1].plot(y_positions, Iy_fit, label=gauss_y_label, color="C1")
+*** End Patch

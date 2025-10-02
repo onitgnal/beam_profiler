@@ -73,6 +73,8 @@ __all__ = [
 
 
 def _resolve_clip_mode(value: Union[bool, str, None], *, default: ClipMode = "none") -> ClipMode:
+    # Translate user-facing options into an internal clip mode.
+    # Accepts booleans (True->'zero', False->'none'), strings, or None.
     if value is None:
         return default
     if isinstance(value, bool):
@@ -99,7 +101,8 @@ def _apply_clip_mode(arr: np.ndarray, mode: ClipMode) -> np.ndarray:
         np.maximum(arr, 0.0, out=arr)
         return arr
 
-    # mode == "otsu"
+    # mode == "otsu": compute a constant floor (Otsu over finite values)
+    # and subtract it before clipping to zero.
     finite_vals = arr[finite_mask]
     rmin = float(finite_vals.min())
     shifted = finite_vals - rmin
@@ -130,6 +133,7 @@ def _apply_clip_mode(arr: np.ndarray, mode: ClipMode) -> np.ndarray:
 
 
 def _analyze_beam_worker(payload: Tuple[ArrayLike, Dict[str, object]]) -> Dict[str, object]:
+    # Helper used by analyze_beam_batch for parallel processing
     img, kwargs = payload
     return analyze_beam(img, **kwargs)
 
@@ -177,6 +181,7 @@ def bg_subtract(
     if h == 0 or w == 0:
         return _apply_clip_mode(arr.copy(), clip_mode)
 
+    # Border ring width set to ceil(5% * min(h, w))
     m = int(np.ceil(0.05 * min(h, w)))
     if m < 1:
         finite = np.isfinite(arr)
@@ -184,6 +189,7 @@ def bg_subtract(
             return _apply_clip_mode(arr.copy(), clip_mode)
         return _apply_clip_mode(arr - np.median(arr[finite]), clip_mode)
 
+    # Build edge ring mask; avoid double-counting corners
     border_mask = np.zeros((h, w), dtype=bool)
     border_mask[:m, :] = True
     border_mask[-m:, :] = True
@@ -205,6 +211,7 @@ def bg_subtract(
     if z.size < 3:
         return _apply_clip_mode(arr - np.median(z), clip_mode)
 
+    # Robustly fit an affine plane a*x + b*y + c to border samples
     A = np.column_stack((x, y, np.ones_like(x)))
     params = None
     for _ in range(3):
@@ -228,6 +235,7 @@ def bg_subtract(
     if params is None:
         return _apply_clip_mode(arr - np.median(z), clip_mode)
 
+    # Evaluate the plane on the full grid and subtract
     bg_plane = params[0] * x_indices + params[1] * y_indices + params[2]
     return _apply_clip_mode(arr - bg_plane, clip_mode)
 
@@ -289,7 +297,8 @@ def get_beam_size(profile: ArrayLike) -> Tuple[float, float, float, float, float
     Returns
     -------
     tuple of float
-        ``(rx, ry, cx, cy, phi)`` where ``phi`` is the major principal
+        ``(rx, ry, cx, cy, phi)`` where ``rx`` and ``ry`` are 2·sigma
+        second-moment radii, and ``phi`` is the major principal
         axis angle in radians, counter-clockwise from +x in laboratory
         coordinates (y up).
     """
@@ -391,7 +400,7 @@ def get_beam_size_old(profile: ArrayLike) -> Tuple[float, float, float, float, f
 
 
 def fit_gaussian(x: np.ndarray, y: np.ndarray, start_params: Tuple[float, float, float]) -> Tuple[Tuple[float, float, float], np.ndarray]:
-    """Fit a 1D Gaussian of the form ``A exp(-2 ((x - centre)/radius)**2)``.
+    """Fit a 1D Gaussian: ``A * exp(-2 * ((x - centre)/radius)**2)``.
 
     The Gaussian used here matches the model employed in the MATLAB
     function ``fitGauss``【881670830533059†screenshot】.  The decay constant ``radius`` corresponds
@@ -432,6 +441,9 @@ def iso_second_moment(
     angle_clip_mode: Union[bool, str, None] = "otsu",
     tol: float = 1,
     max_iterations: int = 100,
+    *,
+    background_subtraction: bool = True,
+    rotation_angle: Optional[float] = None,
 ) -> Dict[str, object]:
     """Iteratively compute ISO second‑moment beam parameters.
 
@@ -471,6 +483,12 @@ def iso_second_moment(
     max_iterations : int, optional
         Maximum number of iterations.  If the algorithm does not converge
         within this many iterations, a warning is issued.
+    background_subtraction : bool, optional
+        If True (default), subtract a robust affine plane background at
+        full-frame and ROI levels. If False, use raw values.
+    rotation_angle : float or None, optional
+        Fixed principal-axis angle (radians). If provided, overrides the
+        automatically estimated angle for the analysis/rotation steps.
 
     Returns
     -------
@@ -511,8 +529,11 @@ def iso_second_moment(
     """
     # convert to float and ensure a copy so modifications do not affect the original
     raw_img = np.asarray(img, dtype=np.float64)
-    # Base background subtraction (no clipping) then apply clipping modes in-place
-    full_img_base = bg_subtract(raw_img, clip_negatives="none")
+    # Base background handling: optionally subtract background, otherwise use raw image
+    if background_subtraction:
+        full_img_base = bg_subtract(raw_img, clip_negatives="none")
+    else:
+        full_img_base = raw_img.copy()
 
     clip_mode = _resolve_clip_mode(clip_negatives)
     angle_mode = _resolve_clip_mode(angle_clip_mode, default=clip_mode)
@@ -533,13 +554,14 @@ def iso_second_moment(
 
     ny, nx = full_img.shape
     # initial centre: use smoothed image to avoid hot pixels
+    # Light Gaussian blur reduces influence of hot pixels on seed location
     smoothed = gaussian_filter(full_img, sigma=2.0)
     max_idx = np.unravel_index(np.argmax(smoothed), smoothed.shape)
     cy, cx = float(max_idx[0]), float(max_idx[1])
     # estimate FWHM along rows/columns as the initial radius
     row = full_img[int(cy), :]
     col = full_img[:, int(cx)]
-    # avoid division by zero
+    # Avoid division by zero when normalizing row/column slices
     if row.max() > 0:
         ix = row / row.max()
         above_half = np.where(ix > 0.5)[0]
@@ -563,19 +585,22 @@ def iso_second_moment(
     processed_img = None
     phi = 0.0
     for iteration in range(1, max_iterations + 1):
-        # compute crop bounds around the current centre
+        # Compute crop bounds around the current centre
         xmin = int(round(cx - rx * aperture_factor))
         xmax = int(round(cx + rx * aperture_factor))
         ymin = int(round(cy - ry * aperture_factor))
         ymax = int(round(cy + ry * aperture_factor))
-        # clamp to image boundaries
+        # Clamp to image boundaries
         xmin = max(xmin, 0)
         ymin = max(ymin, 0)
         xmax = min(xmax, nx - 1)
         ymax = min(ymax, ny - 1)
-        # extract and subtract background on the crop as in M2tool (corner-based BGsub)
+        # Extract ROI and optionally subtract background on the crop
         cropped = full_img[ymin:ymax + 1, xmin:xmax + 1]
-        cropped_base = bg_subtract(cropped, clip_negatives="none")
+        if background_subtraction:
+            cropped_base = bg_subtract(cropped, clip_negatives="none")
+        else:
+            cropped_base = cropped.copy()
 
         if clip_mode == "none":
             processed = cropped_base
@@ -591,14 +616,17 @@ def iso_second_moment(
             processed_angle = cropped_base.copy()
             _apply_clip_mode(processed_angle, angle_mode)
 
-        # compute second moment radii and centroid in the cropped frame
+        # Compute second moments and centroid in the cropped frame
         rx_new, ry_new, cx_local, cy_local, _ = get_beam_size(processed)
-        # principal-axis angle from the Otsu-clipped data for robustness
-        _, _, _, _, phi = get_beam_size(processed_angle)
-        # update global centre coordinates
+        # Principal-axis angle from the angle-processed data (or fixed)
+        if rotation_angle is None:
+            _, _, _, _, phi = get_beam_size(processed_angle)
+        else:
+            phi = float(rotation_angle)
+        # Update global centre in full-image coordinates
         cx = cx_local + xmin
         cy = cy_local + ymin
-        # check convergence
+        # Convergence check on radii
         if abs(rx_new - prev_rx) + abs(ry_new - prev_ry) < tol:
             rx, ry = rx_new, ry_new
             crop_ymin, crop_xmin = ymin, xmin
@@ -613,7 +641,7 @@ def iso_second_moment(
         # assign last values
         pass
     iterations = iteration
-    # optionally rotate the final processed image to align principal axes
+    # Optionally rotate the final processed image to align principal axes
     rotated_img = None
     rotated_crop_origin = None
     phi_rot = None  # rotation in the rotated image frame (expected ~0)
@@ -658,6 +686,7 @@ def iso_second_moment(
             x_insert_end = x_offset + w_old
             expanded_processed[y_offset:y_insert_end, x_offset:x_insert_end] = processed_img
 
+            # Rotate the expanded patch (keeps border statistics realistic)
             rotated_full = nd_rotate(
                 expanded_processed,
                 angle=rot_deg,
@@ -707,6 +736,10 @@ def analyze_beam(
     angle_clip_mode: Union[bool, str, None] = "otsu",
     tol: float = 0.5,
     max_iterations: int = 100,
+    *,
+    background_subtraction: bool = True,
+    rotation_angle: Optional[float] = None,
+    compute_gaussian: bool = True,
 ) -> Dict[str, object]:
     """Analyse a beam image and return ISO and Gaussian beam parameters.
 
@@ -737,6 +770,15 @@ def analyze_beam(
         Convergence tolerance in pixels for the ISO second‑moment method.
     max_iterations : int, optional
         Maximum number of iterations for the ISO method.
+    background_subtraction : bool, optional
+        If True (default), subtract a robust affine background. If False,
+        analyse raw data.
+    rotation_angle : float or None, optional
+        Fixed principal-axis angle (radians). If provided, overrides the
+        automatically estimated angle.
+    compute_gaussian : bool, optional
+        If False, skip Gaussian fits and return ``gauss_fit_x`` and
+        ``gauss_fit_y`` as ``None``.
 
     Returns
     -------
@@ -756,6 +798,8 @@ def analyze_beam(
         angle_clip_mode=angle_clip_mode,
         tol=tol,
         max_iterations=max_iterations,
+        background_subtraction=background_subtraction,
+        rotation_angle=rotation_angle,
     )
     # compute spectra along principal axes using the rotated image when available
     rotated_img = iso_result["rotated_img"]
@@ -789,18 +833,34 @@ def analyze_beam(
     Ix = spectrum_img.sum(axis=0)
     Iy = spectrum_img.sum(axis=1)
 
-    # initial guesses for Gaussian fit using ISO results
-    # amplitude guess: max value of spectrum
-    # centre guess: ISO centroid along each axis
-    # radius guess: second moment radii (rx, ry)
-    centre_x = iso_result["cx"]
-    centre_y = iso_result["cy"]
-    rx = iso_result["rx"]
-    ry = iso_result["ry"]
-    # fit along x
-    params_x, cov_x = fit_gaussian(x_positions, Ix, (Ix.max(), centre_x, max(rx, 1e-3)))
-    # fit along y
-    params_y, cov_y = fit_gaussian(y_positions, Iy, (Iy.max(), centre_y, max(ry, 1e-3)))
+    # Optionally perform Gaussian fits along principal axes
+    gauss_fit_x = None
+    gauss_fit_y = None
+    if compute_gaussian:
+        # initial guesses for Gaussian fit using ISO results
+        # amplitude guess: max value of spectrum
+        # centre guess: ISO centroid along each axis
+        # radius guess: second moment radii (rx, ry)
+        centre_x = iso_result["cx"]
+        centre_y = iso_result["cy"]
+        rx = iso_result["rx"]
+        ry = iso_result["ry"]
+        # fit along x
+        params_x, cov_x = fit_gaussian(x_positions, Ix, (Ix.max(), centre_x, max(rx, 1e-3)))
+        # fit along y
+        params_y, cov_y = fit_gaussian(y_positions, Iy, (Iy.max(), centre_y, max(ry, 1e-3)))
+        gauss_fit_x = {
+            "amplitude": params_x[0],
+            "centre": params_x[1],
+            "radius": params_x[2],
+            "covariance": cov_x,
+        }
+        gauss_fit_y = {
+            "amplitude": params_y[0],
+            "centre": params_y[1],
+            "radius": params_y[2],
+            "covariance": cov_y,
+        }
     return {
         "img_for_spec": img_for_spec,
         "img_for_spec_origin": crop_origin,
@@ -811,18 +871,8 @@ def analyze_beam(
         "cy": iso_result["cy"],
         "Ix_spectrum": (x_positions, Ix),
         "Iy_spectrum": (y_positions, Iy),
-        "gauss_fit_x": {
-            "amplitude": params_x[0],
-            "centre": params_x[1],
-            "radius": params_x[2],
-            "covariance": cov_x,
-        },
-        "gauss_fit_y": {
-            "amplitude": params_y[0],
-            "centre": params_y[1],
-            "radius": params_y[2],
-            "covariance": cov_y,
-        },
+        "gauss_fit_x": gauss_fit_x,
+        "gauss_fit_y": gauss_fit_y,
         "iterations": iso_result["iterations"],
     }
 
@@ -864,6 +914,7 @@ def analyze_beam_batch(
     # Ensure inputs are NumPy arrays prior to pickling for worker processes
     payloads = [(frame, analyze_kwargs) for frame in images_list]
 
+    # Use a process pool to parallelize per-frame analysis
     with ProcessPoolExecutor(max_workers=max_workers) as pool:
         results = list(pool.map(_analyze_beam_worker, payloads, chunksize=chunksize))
     return results

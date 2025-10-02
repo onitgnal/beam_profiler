@@ -60,8 +60,61 @@ def main(image_path: str, pixel_size: Optional[float] = None, pixel_unit: str = 
     with Image.open(image_path) as img:
         data = np.asarray(img.convert("L"), dtype=float)
 
-    # Run the beam analysis; adjust aperture_factor here if necessary
-    result = analyze_beam(data)
+    # Build analysis options from CLI if provided
+    _opts = globals().get('_beam_example_opts')
+    if _opts is None:
+        _compute = "both"
+        _clip_negatives = "none"
+        _angle_clip_mode = "otsu"
+        _background_subtraction = True
+        _rotation_mode = "auto"
+        _fixed_angle_deg = None
+    else:
+        _compute = _opts.get("compute", "both")
+        _clip_negatives = _opts.get("clip_negatives", "none")
+        _angle_clip_mode = _opts.get("angle_clip_mode", "otsu")
+        _background_subtraction = _opts.get("background_subtraction", True)
+        _rotation_mode = _opts.get("rotation_mode", "auto")
+        _fixed_angle_deg = _opts.get("fixed_angle_deg", None)
+
+    # Determine rotation angle per CLI:
+    # - auto: ignore any fixed angle and auto-detect principal axis
+    # - fixed: use provided fixed angle in degrees, or 0 if omitted
+    rotation_angle = None
+    if _rotation_mode == "auto":
+        rotation_angle = None
+    elif _rotation_mode == "fixed":
+        if _fixed_angle_deg is None:
+            rotation_angle = 0.0
+        else:
+            rotation_angle = np.deg2rad(float(_fixed_angle_deg))
+
+    # Map angle clip mode 'same' to None to reuse clip_negatives
+    angle_mode_param = None if (_angle_clip_mode is None or _angle_clip_mode == "same") else _angle_clip_mode
+
+    # Run the analysis unless disabled
+    if _compute == "none":
+        result = None
+    else:
+        result = analyze_beam(
+            data,
+            clip_negatives=_clip_negatives,
+            angle_clip_mode=angle_mode_param,
+            background_subtraction=_background_subtraction,
+            rotation_angle=rotation_angle,
+            compute_gaussian=(_compute in ("both", "gauss")),
+        )
+
+    # If no analysis requested, show the raw image and return
+    if result is None:
+        fig, ax = plt.subplots(figsize=(6, 6))
+        ax.imshow(data, cmap="gray")
+        ax.set_title("Beam image (no analysis)")
+        ax.set_xlabel("X (pixels)")
+        ax.set_ylabel("Y (pixels)")
+        fig.tight_layout()
+        plt.show()
+        return
 
     # Unpack the spectra and fit parameters
     x_positions, Ix = result["Ix_spectrum"]
@@ -75,7 +128,7 @@ def main(image_path: str, pixel_size: Optional[float] = None, pixel_unit: str = 
     ry_iso = result["ry_iso"]
     is_major_x = rx_iso >= ry_iso
 
-    if pixel_size is not None:
+    if pixel_size is not None and fit_x is not None and fit_y is not None:
         print(
             "Pixel size set to "
             f"{pixel_size:.6g} {pixel_unit}\n"
@@ -85,34 +138,42 @@ def main(image_path: str, pixel_size: Optional[float] = None, pixel_unit: str = 
             f"wᵧ = {fit_y['radius']:.3f} px ({fit_y['radius'] * pixel_size:.3f} {pixel_unit})"
         )
 
-    # Build fitted curves for plotting
+    # Build fitted curves for plotting (only when Gaussian fits are available)
     def gauss_curve(x: np.ndarray, params: dict) -> np.ndarray:
         return params["amplitude"] * np.exp(-2.0 * ((x - params["centre"]) / params["radius"]) ** 2)
 
-    Ix_fit = gauss_curve(x_positions, fit_x)
-    Iy_fit = gauss_curve(y_positions, fit_y)
+    _compute = globals().get('_beam_example_opts', {}).get('compute', 'both')
+    Ix_fit = gauss_curve(x_positions, fit_x) if (_compute in ("both", "gauss") and fit_x is not None) else None
+    Iy_fit = gauss_curve(y_positions, fit_y) if (_compute in ("both", "gauss") and fit_y is not None) else None
 
     # Create plots
     fig, axes = plt.subplots(2, 1, figsize=(8, 6), sharex=False)
 
     # Plot Ix
     axes[0].plot(x_positions, Ix, label="Ix (integrated)", color="C0")
-    if pixel_size is not None:
-        gauss_x_label = (
-            f"Gaussian fit (w={fit_x['radius']:.2f} px / "
-            f"{fit_x['radius'] * pixel_size:.2f} {pixel_unit})"
-        )
-    else:
-        gauss_x_label = f"Gaussian fit (w={fit_x['radius']:.2f} px)"
-    axes[0].plot(x_positions, Ix_fit, label=gauss_x_label, color="C1")
+    _compute = globals().get('_beam_example_opts', {}).get('compute', 'both')
+    gauss_x_label = "Gaussian fit"
+    if _compute in ("both", "gauss") and fit_x is not None:
+        if pixel_size is not None:
+            gauss_x_label = (
+                f"Gaussian fit (w={fit_x['radius']:.2f} px / "
+                f"{fit_x['radius'] * pixel_size:.2f} {pixel_unit})"
+            )
+        else:
+            gauss_x_label = f"Gaussian fit (w={fit_x['radius']:.2f} px)"
+    _compute = globals().get('_beam_example_opts', {}).get('compute', 'both')
+    if _compute in ("both", "gauss") and Ix_fit is not None:
+        axes[0].plot(x_positions, Ix_fit, label=gauss_x_label, color="C1")
     # Indicate second moment radius (2σ) on the x spectrum
     x_label = "ISO rₓ (major)" if is_major_x else "ISO rₓ (minor)"
     if pixel_size is not None:
         iso_rx_label = f"{x_label} = {rx_iso:.2f} px ({rx_iso * pixel_size:.2f} {pixel_unit})"
     else:
         iso_rx_label = f"{x_label} = {rx_iso:.2f} px"
-    axes[0].axvline(cx - rx_iso, linestyle="--", color="C2", alpha=0.7, label=iso_rx_label)
-    axes[0].axvline(cx + rx_iso, linestyle="--", color="C2", alpha=0.7)
+    _compute = globals().get('_beam_example_opts', {}).get('compute', 'both')
+    if _compute in ("both", "second"):
+        axes[0].axvline(cx - rx_iso, linestyle="--", color="C2", alpha=0.7, label=iso_rx_label)
+        axes[0].axvline(cx + rx_iso, linestyle="--", color="C2", alpha=0.7)
     axes[0].set_xlabel("X position (pixels)")
     axes[0].set_ylabel("Integrated intensity")
     axes[0].set_title("Spectrum along principal x‑axis")
@@ -129,14 +190,19 @@ def main(image_path: str, pixel_size: Optional[float] = None, pixel_unit: str = 
 
     # Plot Iy
     axes[1].plot(y_positions, Iy, label="Iy (integrated)", color="C0")
-    if pixel_size is not None:
-        gauss_y_label = (
-            f"Gaussian fit (w={fit_y['radius']:.2f} px / "
-            f"{fit_y['radius'] * pixel_size:.2f} {pixel_unit})"
-        )
-    else:
-        gauss_y_label = f"Gaussian fit (w={fit_y['radius']:.2f} px)"
-    axes[1].plot(y_positions, Iy_fit, label=gauss_y_label, color="C1")
+    _compute = globals().get('_beam_example_opts', {}).get('compute', 'both')
+    gauss_y_label = "Gaussian fit"
+    if _compute in ("both", "gauss") and fit_y is not None:
+        if pixel_size is not None:
+            gauss_y_label = (
+                f"Gaussian fit (w={fit_y['radius']:.2f} px / "
+                f"{fit_y['radius'] * pixel_size:.2f} {pixel_unit})"
+            )
+        else:
+            gauss_y_label = f"Gaussian fit (w={fit_y['radius']:.2f} px)"
+    _compute = globals().get('_beam_example_opts', {}).get('compute', 'both')
+    if _compute in ("both", "gauss") and Iy_fit is not None:
+        axes[1].plot(y_positions, Iy_fit, label=gauss_y_label, color="C1")
     # Indicate second moment radius (2σ) on the y spectrum
     cy = result["cy"]
     y_label = "ISO rᵧ (major)" if not is_major_x else "ISO rᵧ (minor)"
@@ -144,8 +210,10 @@ def main(image_path: str, pixel_size: Optional[float] = None, pixel_unit: str = 
         iso_ry_label = f"{y_label} = {ry_iso:.2f} px ({ry_iso * pixel_size:.2f} {pixel_unit})"
     else:
         iso_ry_label = f"{y_label} = {ry_iso:.2f} px"
-    axes[1].axvline(cy - ry_iso, linestyle="--", color="C2", alpha=0.7, label=iso_ry_label)
-    axes[1].axvline(cy + ry_iso, linestyle="--", color="C2", alpha=0.7)
+    _compute = globals().get('_beam_example_opts', {}).get('compute', 'both')
+    if _compute in ("both", "second"):
+        axes[1].axvline(cy - ry_iso, linestyle="--", color="C2", alpha=0.7, label=iso_ry_label)
+        axes[1].axvline(cy + ry_iso, linestyle="--", color="C2", alpha=0.7)
     axes[1].set_xlabel("Y position (pixels)")
     axes[1].set_ylabel("Integrated intensity")
     axes[1].set_title("Spectrum along principal y‑axis")
@@ -228,14 +296,18 @@ def main(image_path: str, pixel_size: Optional[float] = None, pixel_unit: str = 
     major_vec /= major_norm
     minor_vec /= minor_norm
 
-    gauss_rx = fit_x["radius"]
-    gauss_ry = fit_y["radius"]
-    if ry_iso > rx_iso:
-        gauss_major_radius = gauss_ry
-        gauss_minor_radius = gauss_rx
+    gauss_rx = fit_x["radius"] if fit_x is not None else None
+    gauss_ry = fit_y["radius"] if fit_y is not None else None
+    if gauss_rx is not None and gauss_ry is not None:
+        if ry_iso > rx_iso:
+            gauss_major_radius = gauss_ry
+            gauss_minor_radius = gauss_rx
+        else:
+            gauss_major_radius = gauss_rx
+            gauss_minor_radius = gauss_ry
     else:
-        gauss_major_radius = gauss_rx
-        gauss_minor_radius = gauss_ry
+        gauss_major_radius = None
+        gauss_minor_radius = None
 
     def ellipse_coords(a_radius: float, b_radius: float) -> Tuple[np.ndarray, np.ndarray]:
         t = np.linspace(0.0, 2.0 * np.pi, 361)
@@ -246,10 +318,12 @@ def main(image_path: str, pixel_size: Optional[float] = None, pixel_unit: str = 
         return x_vals, y_vals
 
     iso_x, iso_y = ellipse_coords(major_radius, minor_radius)
-    gauss_x, gauss_y = ellipse_coords(gauss_major_radius, gauss_minor_radius)
-
-    ax_img.plot(iso_x, iso_y, color="white", linewidth=2.0, label="ISO ellipse")
-    ax_img.plot(gauss_x, gauss_y, color="yellow", linewidth=2.0, linestyle="--", label="Gaussian ellipse")
+    _compute = globals().get('_beam_example_opts', {}).get('compute', 'both')
+    if _compute in ("both", "second"):
+        ax_img.plot(iso_x, iso_y, color="white", linewidth=2.0, label="ISO ellipse")
+    if _compute in ("both", "gauss") and gauss_major_radius is not None and gauss_minor_radius is not None:
+        gauss_x, gauss_y = ellipse_coords(gauss_major_radius, gauss_minor_radius)
+        ax_img.plot(gauss_x, gauss_y, color="yellow", linewidth=2.0, linestyle="--", label="Gaussian ellipse")
 
     # Principal axis lines drawn using the eigenvectors
     major_line_x = [cx - major_radius * major_vec[0], cx + major_radius * major_vec[0]]
@@ -257,8 +331,9 @@ def main(image_path: str, pixel_size: Optional[float] = None, pixel_unit: str = 
     minor_line_x = [cx - minor_radius * minor_vec[0], cx + minor_radius * minor_vec[0]]
     minor_line_y = [cy - minor_radius * minor_vec[1], cy + minor_radius * minor_vec[1]]
 
-    ax_img.plot(major_line_x, major_line_y, color="cyan", linewidth=1.5, label="Major axis")
-    ax_img.plot(minor_line_x, minor_line_y, color="magenta", linewidth=1.5, label="Minor axis")
+    if _compute in ("both", "second"):
+        ax_img.plot(major_line_x, major_line_y, color="cyan", linewidth=1.5, label="Major axis")
+        ax_img.plot(minor_line_x, minor_line_y, color="magenta", linewidth=1.5, label="Minor axis")
 
     ax_img.legend(loc="upper right")
     ax_img.set_xlim(x_min_display, x_max_display)
@@ -307,6 +382,42 @@ if __name__ == "__main__":
         default="µm",
         help="Unit string used when displaying physical radii (default: µm).",
     )
+    # Additional analysis options
+    parser.add_argument(
+        "--compute",
+        choices=["both", "second", "gauss", "none"],
+        default="both",
+        help="Choose what to calculate/display: both, ISO second-moment, Gaussian fit, or none.",
+    )
+    parser.add_argument(
+        "--clip-negatives",
+        choices=["none", "zero", "otsu"],
+        default="none",
+        help="Negative-value handling after background subtraction (none, zero, otsu).",
+    )
+    parser.add_argument(
+        "--angle-clip-mode",
+        choices=["same", "none", "zero", "otsu"],
+        default="otsu",
+        help="Background handling for angle estimation; 'same' reuses --clip-negatives.",
+    )
+    parser.add_argument(
+        "--no-background-subtraction",
+        action="store_true",
+        help="Disable background subtraction in the analysis.",
+    )
+    parser.add_argument(
+        "--rotation",
+        choices=["auto", "fixed"],
+        default="auto",
+        help="Principal-axis rotation control: automatic (default) or fixed angle.",
+    )
+    parser.add_argument(
+        "--fixed-angle",
+        type=float,
+        default=None,
+        help="Fixed rotation angle in degrees (requires --rotation fixed).",
+    )
     args = parser.parse_args()
     image_file = Path(args.image_path)
     if not image_file.is_file():
@@ -315,4 +426,14 @@ if __name__ == "__main__":
     if args.pixel_size is not None and args.pixel_size <= 0:
         print("Error: --pixel-size must be positive if provided.")
         sys.exit(1)
+    _beam_example_opts = {
+        "compute": args.compute,
+        "clip_negatives": args.clip_negatives,
+        "angle_clip_mode": args.angle_clip_mode,
+        "background_subtraction": (not args.no_background_subtraction),
+        "rotation_mode": args.rotation,
+        "fixed_angle_deg": args.fixed_angle,
+    }
+    globals()["_beam_example_opts"] = _beam_example_opts
     main(str(image_file), pixel_size=args.pixel_size, pixel_unit=args.pixel_unit)
+
