@@ -1,52 +1,23 @@
 """
 beam_analysis.py
-~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~
 
-This module provides functions to analyse transverse laser beam profiles
-similar to those used in the original MATLAB ``M2tool``.  The core
-capabilities implemented here are:
+Analysis helpers for transverse laser beam profiles (2D intensity images).
 
-* ``ISO`` second‑moment method: an iterative procedure to estimate the
-  second‑moment beam radii (2‑σ) along the principal axes of an elliptical
-  beam.  During each iteration a region of interest is cropped around
-  the provisional beam centre; a robust background estimate (from the
-  5 % image border) is subtracted; the second moments are computed; and
-  the region of interest is updated.  Convergence is reached when the
-  radii change by less than ``tol`` pixels.  The algorithm is based on
-  the MATLAB code shown in ``M2tool.m`` where cropping and background
-  subtraction are performed iteratively【881670830533059†screenshot】.
+Capabilities:
+- ISO 11146 second-moment method: iteratively estimate centroid, principal-axis angle, and second-moment radii (2*sigma) with robust background handling.
+- 1D Gaussian fits along the principal axes: fit integrated profiles to A * exp(-2 * ((x - centre)/radius)**2) to obtain 1/e^2 radii.
 
-* Gaussian fits along the principal axes: once the beam is aligned
-  to its principal axes (by rotating the image according to the angle
-  returned from the second‑moment calculation), the integrated
-  intensity along each axis is fitted to the model
-  ``A exp(−2 ((x − centre)/radius)²)``.  The starting values for the
-  amplitude, centre and radius are taken from the second‑moment results
-  (similar to the ``fitGauss`` function in the MATLAB code【881670830533059†screenshot】).
+High-level API: analyze_beam(image) returns a dict with:
+- theta: principal-axis angle (radians)
+- rx_iso, ry_iso: second-moment radii (2*sigma)
+- cx, cy: centroid (pixels) in original image coordinates
+- Ix_spectrum, Iy_spectrum: (positions, intensity) tuples
+- img_for_spec, img_for_spec_origin: processed ROI (not rotated) and its origin
+- gauss_fit_x, gauss_fit_y: Gaussian fit dicts (amplitude, centre, radius, covariance)
+- iterations: ISO iteration count
 
-The main entry point is :func:`analyze_beam`, which accepts a 2D image
-(NumPy array) and returns a dictionary containing:
-
-* ``theta`` – rotation angle (in radians) of the principal axis.
-* ``rx_iso`` and ``ry_iso`` – second moment radii (two sigma) along the
-  major and minor axes.
-* ``cx`` and ``cy`` – beam centre coordinates in pixel units
-  relative to the original input image.
-* ``Ix_spectrum`` and ``Iy_spectrum`` – one‑dimensional cuts through
-  the beam along the principal axes after the final iteration, as
-  ``(x_positions, intensity)`` and ``(y_positions, intensity)`` arrays.
-* ``img_for_spec`` – the final processed region of interest in the input
-  orientation, suitable for plotting without additional rotations.
-* ``img_for_spec_origin`` – ``(ymin, xmin)`` coordinates of the
-  top‑left pixel of ``img_for_spec`` within the original input image.
-* ``gauss_fit_x`` and ``gauss_fit_y`` – dictionaries containing
-  the best‑fit parameters ``A``, ``centre`` and ``radius`` for the
-  Gaussian fits to ``Ix_spectrum`` and ``Iy_spectrum``.
-* ``iterations`` – number of iterations used by the ISO second‑moment
-  method.
-
-The library is written without any GUI dependencies and can therefore be
-used in headless environments.  It relies solely on NumPy and SciPy.
+Depends on NumPy and SciPy only.
 """
 
 from __future__ import annotations
@@ -338,37 +309,22 @@ def get_beam_size(profile: ArrayLike) -> Tuple[float, float, float, float, float
 
 
 def get_beam_size_old(profile: ArrayLike) -> Tuple[float, float, float, float, float]:
-    """Compute second‑moment beam parameters.
+    """Legacy second-moment computation (kept for reference).
 
-    Given a 2D intensity distribution ``profile``, this function
-    calculates the centroid coordinates ``(cx, cy)``, the second‑moment
-    radii along the horizontal and vertical axes ``(rx, ry)`` and the
-    rotation angle ``phi`` of the principal axes.  The algorithm
-    implements the formulas from the MATLAB function ``getBeamSize``
-    where the radii are defined as ``2*sqrt(<x²>)`` with ``<…>``
-    denoting the intensity‑weighted second moment【881670830533059†screenshot】.  The angle
-    ``phi`` is computed using the standard two‑argument arctangent to
-    correctly determine the quadrant of the rotation.
+    Computes centroid (cx, cy), second-moment radii (rx, ry = 2*sigma)
+    along x and y image axes, and the principal-axis rotation ``phi``
+    (radians, counter-clockwise from +x). Prefer :func:`get_beam_size`
+    for improved numerical handling.
 
     Parameters
     ----------
     profile : array_like
-        2D array containing the (background‑subtracted) intensity values.
+        2D background-subtracted intensity array.
 
     Returns
     -------
-    rx : float
-        Second‑moment beam radius (2σ) in the x‑direction.
-    ry : float
-        Second‑moment beam radius (2σ) in the y‑direction.
-    cx : float
-        Intensity‑weighted centroid along x (0‑indexed pixel coordinate).
-    cy : float
-        Intensity‑weighted centroid along y (0‑indexed pixel coordinate).
-    phi : float
-        Rotation angle of the principal axis (radians).  A positive
-        angle means the major axis is rotated counter‑clockwise from the
-        x‑axis.
+    tuple of float
+        ``(rx, ry, cx, cy, phi)`` as defined above.
     """
     arr = np.asarray(profile, dtype=np.float64)
     
@@ -445,87 +401,50 @@ def iso_second_moment(
     background_subtraction: bool = True,
     rotation_angle: Optional[float] = None,
 ) -> Dict[str, object]:
-    """Iteratively compute ISO second‑moment beam parameters.
+    """Iteratively compute ISO 11146 second-moment beam parameters.
 
-    Starting from the brightest pixel of the smoothed image, this
-    algorithm repeatedly crops a region around the provisional beam
-    centre, subtracts a robust background, computes second‑moment radii
-    and updates the crop until convergence.  The procedure mirrors the
-    iterative approach in ``beamData`` from the MATLAB code【881670830533059†screenshot】.  Optionally
-    the final image is rotated so that the principal axes align with the
-    horizontal/vertical axes.
+    Overview
+    - Iteratively crop around a provisional centre, subtract background
+      (optional), compute second moments, and update the ROI until
+      convergence or ``max_iterations`` is reached.
+    - Optionally rotate the final ROI so the principal axes align with
+      the image axes.
 
     Parameters
     ----------
     img : array_like
         2D input image (beam profile).
     aperture_factor : float, optional
-        Factor by which the cropping window is larger than the current
-        diameter estimate (default 3.0 as in the MATLAB code ``config.aperture2diameter``【881670830533059†screenshot】).
+        Crop half-size factor relative to the current radius estimate
+        (default 3.0).
     principal_axes_rot : bool, optional
-        If ``True``, return radii along the principal axes by rotating the
-        final cropped image.  If ``False``, the returned radii are along
-        the image axes.
+        If True, return radii along the principal axes by rotating the
+        final cropped image. If False, radii are along the image axes.
     clip_negatives : bool or {"none", "zero", "otsu"}, optional
-        Forwarded to :func:`bg_subtract` for second-moment radii and the
-        spectra. ``False`` retains signed data. ``True``/``"zero"`` clips
-        negative values. ``"otsu"`` applies an additional Otsu-derived
-        floor before clipping.
+        Negative handling for second-moment computation and spectra.
+        'none' keeps signed data; 'zero' clips negatives to zero; 'otsu'
+        first applies an Otsu-derived constant floor, then clips.
     angle_clip_mode : bool or {"none", "zero", "otsu"}, optional
-        Background handling for the principal-axis angle estimation. By
-        default ``"otsu"`` is used to stabilise the angle while keeping the
-        second-moment computation un-clipped. ``None`` reuses
-        ``clip_negatives``.
+        Background handling used only for principal-axis angle
+        estimation. None reuses ``clip_negatives``. Default 'otsu'
+        stabilises angle estimation on noisy data.
     tol : float, optional
-        Convergence tolerance in pixels.  The iterations stop when the
-        sum of absolute differences of the radii between successive
-        iterations is below this value.
+        Convergence tolerance on ``|drx| + |dry|`` in pixels (default 1).
     max_iterations : int, optional
-        Maximum number of iterations.  If the algorithm does not converge
-        within this many iterations, a warning is issued.
+        Maximum number of iterations (default 100).
     background_subtraction : bool, optional
-        If True (default), subtract a robust affine plane background at
-        full-frame and ROI levels. If False, use raw values.
+        If True (default), subtract a robust affine plane background on
+        the full frame and ROI. If False, use raw data.
     rotation_angle : float or None, optional
         Fixed principal-axis angle (radians). If provided, overrides the
-        automatically estimated angle for the analysis/rotation steps.
+        automatically estimated angle.
 
     Returns
     -------
-    result : dict
-        Dictionary containing the results of the ISO second‑moment
-        analysis with the following keys:
-
-        ``cx``, ``cy`` : float
-            Global coordinates (0‑indexed pixels) of the beam centre.
-
-        ``rx``, ``ry`` : float
-            Second‑moment radii (2σ) in the laboratory axes prior to
-            rotating to the principal axes.
-
-        ``phi`` : float
-            Rotation angle (radians) of the principal axis.
-
-        ``iterations`` : int
-            Number of iterations performed.
-
-        ``processed_img`` : ndarray
-            Final cropped, background‑subtracted image used for
-            second‑moment calculation.
-
-        ``crop_origin`` : tuple of ints
-            ``(ymin, xmin)`` coordinates of the top‑left corner of the
-            final crop within the original image.
-
-        ``rotated_img`` : ndarray
-            If ``principal_axes_rot`` is ``True``, the image rotated by
-            ``phi`` so that the principal axes align with the image axes.
-            Otherwise ``None``.
-
-        ``rotated_crop_origin`` : tuple of floats
-            ``(ymin_rot, xmin_rot)`` – the origin of the rotated
-            image relative to the original image (fractional pixel).  Only
-            provided if ``rotated_img`` is not ``None``.
+    dict
+        Keys include: ``cx``, ``cy``, ``rx``, ``ry``, ``phi``,
+        ``iterations``, ``processed_img``, ``crop_origin``,
+        ``rotated_img``, ``rotated_crop_origin``.
     """
     # convert to float and ensure a copy so modifications do not affect the original
     raw_img = np.asarray(img, dtype=np.float64)
@@ -741,33 +660,28 @@ def analyze_beam(
     rotation_angle: Optional[float] = None,
     compute_gaussian: bool = True,
 ) -> Dict[str, object]:
-    """Analyse a beam image and return ISO and Gaussian beam parameters.
+    """Analyse a beam image and return ISO and Gaussian parameters.
 
-    This high‑level function performs the ISO second‑moment analysis and
-    Gaussian fitting along the principal axes.  It is designed to be
-    directly called by users.  The spectra and fit parameters are
-    returned in a dictionary.
+    Runs the ISO 11146 second-moment analysis and, optionally, 1D
+    Gaussian fits along the principal axes. Results include the spectra
+    and (when requested) the fit parameters.
 
     Parameters
     ----------
     img : array_like
-        Input 2D image representing the beam profile.
+        2D beam image.
     aperture_factor : float, optional
-        Factor by which the cropping window is larger than the current
-        diameter estimate (default 3.0).
+        Crop half-size factor relative to the current radius (default 3.0).
     principal_axes_rot : bool, optional
-        Whether to rotate the image to align the principal axes.  For
-        non‑cylindrical beams this is recommended.
+        If True, use a rotated ROI aligned to the principal axes for spectra.
     clip_negatives : bool or {"none", "zero", "otsu"}, optional
-        Forwarded to :func:`iso_second_moment`. ``False`` retains signed
-        data. ``True``/``"zero"`` clips negatives, while ``"otsu"`` applies
-        an additional Otsu-derived floor before clipping.
+        Negative handling for second-moment computation and spectra.
+        See :func:`iso_second_moment`.
     angle_clip_mode : bool or {"none", "zero", "otsu"}, optional
-        Mode used internally for the principal-axis estimation. Defaults
-        to ``"otsu"`` for robust angle determination. ``None`` reuses
-        ``clip_negatives``.
+        Background handling used only during angle estimation. See
+        :func:`iso_second_moment`.
     tol : float, optional
-        Convergence tolerance in pixels for the ISO second‑moment method.
+        Convergence tolerance in pixels for the ISO method.
     max_iterations : int, optional
         Maximum number of iterations for the ISO method.
     background_subtraction : bool, optional
@@ -777,17 +691,14 @@ def analyze_beam(
         Fixed principal-axis angle (radians). If provided, overrides the
         automatically estimated angle.
     compute_gaussian : bool, optional
-        If False, skip Gaussian fits and return ``gauss_fit_x`` and
-        ``gauss_fit_y`` as ``None``.
+        If True (default), perform 1D Gaussian fits and return
+        ``gauss_fit_x`` and ``gauss_fit_y``. If False, those entries are
+        ``None``.
 
     Returns
     -------
-    result : dict
-        Dictionary containing the beam parameters and helper data. See
-        the module level documentation for the list of keys. Notably,
-        ``img_for_spec`` holds the non-rotated cropped image (with
-        origin ``img_for_spec_origin``), while the 1D spectra remain
-        aligned to the principal axes.
+    dict
+        See keys documented in :func:`iso_second_moment` and above.
     """
     # run ISO second‑moment analysis
     iso_result = iso_second_moment(
