@@ -715,26 +715,25 @@ def analyze_beam(
     # compute spectra along principal axes using the rotated image when available
     rotated_img = iso_result["rotated_img"]
     processed_img = iso_result["processed_img"]
-    crop_origin = iso_result["crop_origin"]
-
     if processed_img is None or processed_img.size == 0:
         raise ValueError("ISO analysis returned an empty processed image; cannot compute spectra.")
 
     if rotated_img is not None and rotated_img.size > 0:
         spectrum_img = rotated_img
-        ymin_spec, xmin_spec = iso_result["rotated_crop_origin"]
+        img_for_spec = rotated_img
+        crop_origin = iso_result["rotated_crop_origin"]
+        ymin_spec, xmin_spec = crop_origin
         h_spec, w_spec = spectrum_img.shape
         x_positions = xmin_spec + np.arange(w_spec)
         y_positions = ymin_spec + np.arange(h_spec)
     else:
         spectrum_img = processed_img
-        ymin_spec, xmin_spec = iso_result["crop_origin"]
+        img_for_spec = processed_img
+        crop_origin = iso_result["crop_origin"]
+        ymin_spec, xmin_spec = crop_origin
         h_spec, w_spec = spectrum_img.shape
         x_positions = xmin_spec + np.arange(w_spec)
         y_positions = ymin_spec + np.arange(h_spec)
-
-    # store the non-rotated image for downstream consumers (e.g. plotting)
-    img_for_spec = processed_img
 
     # Integrated profiles along the principal axes remain based on the
     # rotation-aligned image to keep spectra and Gaussian fits unchanged.
