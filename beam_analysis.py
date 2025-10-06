@@ -623,12 +623,35 @@ def iso_second_moment(
 
             rx_rot, ry_rot, cx_rot_local, cy_rot_local, phi_rot = get_beam_size(rotated_img)
             rx, ry = rx_rot, ry_rot
+
+            # The centroid (cx_rot_local, cy_rot_local) is in the coordinate
+            # system of the rotated cropped image. To get the centroid in the
+            # original image's coordinates, we need to apply the inverse
+            # rotation transform.
+            rot_w_center = (rot_w - 1) / 2.0
+            rot_h_center = (rot_h - 1) / 2.0
+
+            # Coordinates of the centroid in the rotated expanded patch
+            x_in_expanded_rotated = cx_rot_local + x_offset
+            y_in_expanded_rotated = cy_rot_local + y_offset
+
+            # Translate to origin for rotation, apply inverse rotation, and translate back
+            x_tr = x_in_expanded_rotated - rot_w_center
+            y_tr = y_in_expanded_rotated - rot_h_center
+            angle_rad = -phi  # Inverse rotation
+            cos_a = np.cos(angle_rad)
+            sin_a = np.sin(angle_rad)
+            x_unrot = x_tr * cos_a - y_tr * sin_a + rot_w_center
+            y_unrot = x_tr * sin_a + y_tr * cos_a + rot_h_center
+
+            # Convert to original full image coordinates
+            cx = x_unrot + (crop_xmin - x_offset)
+            cy = y_unrot + (crop_ymin - y_offset)
+
             rotated_crop_origin = (
                 cy_pre_rot - cy_rot_local,
                 cx_pre_rot - cx_rot_local,
             )
-            cx = cx_rot_local + rotated_crop_origin[1]
-            cy = cy_rot_local + rotated_crop_origin[0]
     return {
         "cx": cx,
         "cy": cy,
@@ -715,25 +738,26 @@ def analyze_beam(
     # compute spectra along principal axes using the rotated image when available
     rotated_img = iso_result["rotated_img"]
     processed_img = iso_result["processed_img"]
+    crop_origin = iso_result["crop_origin"]
+
     if processed_img is None or processed_img.size == 0:
         raise ValueError("ISO analysis returned an empty processed image; cannot compute spectra.")
 
     if rotated_img is not None and rotated_img.size > 0:
         spectrum_img = rotated_img
-        img_for_spec = rotated_img
-        crop_origin = iso_result["rotated_crop_origin"]
-        ymin_spec, xmin_spec = crop_origin
+        ymin_spec, xmin_spec = iso_result["rotated_crop_origin"]
         h_spec, w_spec = spectrum_img.shape
         x_positions = xmin_spec + np.arange(w_spec)
         y_positions = ymin_spec + np.arange(h_spec)
     else:
         spectrum_img = processed_img
-        img_for_spec = processed_img
-        crop_origin = iso_result["crop_origin"]
-        ymin_spec, xmin_spec = crop_origin
+        ymin_spec, xmin_spec = iso_result["crop_origin"]
         h_spec, w_spec = spectrum_img.shape
         x_positions = xmin_spec + np.arange(w_spec)
         y_positions = ymin_spec + np.arange(h_spec)
+
+    # store the non-rotated image for downstream consumers (e.g. plotting)
+    img_for_spec = processed_img
 
     # Integrated profiles along the principal axes remain based on the
     # rotation-aligned image to keep spectra and Gaussian fits unchanged.
